@@ -1,0 +1,125 @@
+# ===========================================================================
+# Python
+# ===========================================================================
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Editors / IDEs
+.idea/
+.vscode/
+.cursor/
+.cursorignore
+.cursorindexingignore
+.DS_Store
+Thumbs.db
+
+# ===========================================================================
+# OptiSelect: experiment outputs, logs, datasets, checkpoints
+# Do NOT commit any of the below. They can be multi-GB and contain raw text.
+# ===========================================================================
+
+# Datasets — always downloaded/tokenized locally, never committed
+datasets/
+data/datasets/
+src/data/datasets/
+src/src/
+*.bin
+*.arrow
+*.parquet
+*.idx
+
+# Experiment outputs / run artifacts
+exps/
+src/exps/
+results/
+Results/
+outputs/
+
+# Logs
+logs/
+src/logs/
+*.log
+wandb/
+
+# Checkpoints & model weights
+checkpoints/
+ckpt/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# HuggingFace / dataset caches
+.hf_cache/
+
+# Plots / figures produced by runs (keep assets/ which is upstream figures)
+Plots/
+
+# Large JSON produced by selection runs
+selection_stats.json
+summary.json
+shakespeare_results_*.json

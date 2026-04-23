@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+Results/
+Demo/
+init.sh
+llava_dataloader.py
+Plots/
+results/
+README_TODO.md
+core*
+outputs/
