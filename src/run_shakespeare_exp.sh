@@ -57,22 +57,32 @@
 #   (Shakespeare is fast enough that splitting across GPUs is unnecessary)
 #
 # Usage:
-#   bash run_shakespeare_exp.sh [SEED] [NPROC]
+#   bash run_shakespeare_exp.sh [SEED] [NPROC] [TAG]
 #
 # Each optimizer run uses DDP across NPROC GPUs (default 4). The nccl
 # backend auto-divides batch_size*acc_steps across ranks, so effective
 # batch is preserved — runs are just ~NPROC× faster.
+#
+# TAG: optional run label that isolates the results directory and log
+# filenames from other Shakespeare runs. Use this when sweeping a
+# hyperparameter (e.g., TAG=refresh100 for VAL_PROXY_REFRESH=100).
+# Empty TAG preserves the legacy untagged layout.
 # =============================================================================
 
 # Do NOT use set -e — per-run failures must not cascade
 
 SEED=${1:-0}
 NPROC=${2:-4}   # GPUs per run (DDP world size)
+TAG=${3:-}      # optional suffix for isolating this variant's outputs
 
 # ---- Paths ----
 SRC_DIR="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src"
 DATASETS_DIR="/mloscratch/homes/aabdolla/datasets"
-RESULTS_DIR="/mloscratch/homes/aabdolla/results/shakespeare_exp"
+if [ -n "$TAG" ]; then
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/shakespeare_exp_${TAG}"
+else
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/shakespeare_exp"
+fi
 
 cd "$SRC_DIR"
 source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate
@@ -82,7 +92,7 @@ export HF_DATASETS_CACHE=/mloscratch/homes/aabdolla/.hf_cache/datasets
 
 # Memory safety environment
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export SEED RESULTS_DIR
+export SEED RESULTS_DIR TAG
 
 mkdir -p "$RESULTS_DIR" logs
 
@@ -148,7 +158,7 @@ SEL_TEMP=0.1
 SEL_SKETCH=1024
 SEL_REDUNDANCY=1.0
 VAL_PROXY_SIZE=512          # Paper uses 4,096; Shakespeare val = 220K chars ≈ 860 docs at seq=256
-VAL_PROXY_REFRESH=1000      # Refresh more often than paper's 5000 since training is short
+VAL_PROXY_REFRESH=100      # Refresh more often than paper's 5000 since training is short
 
 # Batch configs
 BATCH="--batch_size ${BATCH_SIZE} --sequence_length ${SEQ_LEN} --acc_steps ${ACC_STEPS}"
@@ -188,7 +198,12 @@ run_experiment() {
     local OPT_EXTRA=$4
     local BATCH_OVR=${5:-$BATCH}
 
-    local EXP_NAME="${MODE}_shakespeare_${OPT_NAME}_seed${SEED}"
+    local EXP_NAME
+    if [ -n "$TAG" ]; then
+        EXP_NAME="${MODE}_shakespeare_${TAG}_${OPT_NAME}_seed${SEED}"
+    else
+        EXP_NAME="${MODE}_shakespeare_${OPT_NAME}_seed${SEED}"
+    fi
     local LOG_FILE="logs/${EXP_NAME}.log"
 
     # Skip only if summary has valid final_val_loss

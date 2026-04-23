@@ -37,10 +37,14 @@ DISPLAY = {
 MODES = ["standard", "selection"]
 
 
-def log_filename(dataset, scale, mode, opt, seed):
+def log_filename(dataset, scale, mode, opt, seed, tag=""):
+    parts = [mode, dataset]
     if dataset in SCALED_DATASETS:
-        return f"{mode}_{dataset}_{scale}_{opt}_seed{seed}.log"
-    return f"{mode}_{dataset}_{opt}_seed{seed}.log"
+        parts.append(scale)
+    if tag:
+        parts.append(tag)
+    parts.append(opt)
+    return "_".join(parts) + f"_seed{seed}.log"
 
 
 def parse_log(path):
@@ -74,6 +78,11 @@ def main():
                     help="only used for owt2/slimpajama (small|full)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
+        "--tag",
+        default="",
+        help="optional run label matching the TAG passed to the run_*.sh script",
+    )
+    ap.add_argument(
         "--logs_dir",
         default="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src/logs",
     )
@@ -86,7 +95,7 @@ def main():
         for mode in MODES:
             path = os.path.join(
                 args.logs_dir,
-                log_filename(args.dataset, args.scale, mode, opt, args.seed),
+                log_filename(args.dataset, args.scale, mode, opt, args.seed, args.tag),
             )
             r = parse_log(path)
             results[opt][mode] = r
@@ -95,10 +104,11 @@ def main():
 
     name = DATASET_DISPLAY[args.dataset]
     scale_note = f" [{args.scale}]" if args.dataset in SCALED_DATASETS else ""
+    tag_note = f" tag={args.tag}" if args.tag else ""
     total = len(OPTIMIZERS) * len(MODES)
     print()
     print("=" * 130)
-    print(f"  {name}{scale_note} Results: Standard vs OptiSelect (seed {args.seed})")
+    print(f"  {name}{scale_note} Results: Standard vs OptiSelect (seed {args.seed}{tag_note})")
     print(f"  Found {n_found}/{total} runs")
     print("=" * 130)
 
@@ -140,9 +150,10 @@ def main():
     print("H_sel     → mean sel_entropy across training (higher = more diverse)")
 
     suffix = f"_{args.scale}" if args.dataset in SCALED_DATASETS else ""
+    tag_suffix = f"_{args.tag}" if args.tag else ""
     out = os.path.join(
         args.logs_dir,
-        f"{args.dataset}{suffix}_results_seed{args.seed}.json",
+        f"{args.dataset}{suffix}{tag_suffix}_results_seed{args.seed}.json",
     )
     with open(out, "w") as f:
         json.dump(
@@ -150,6 +161,7 @@ def main():
                 "metadata": {
                     "dataset": args.dataset,
                     "scale": args.scale if args.dataset in SCALED_DATASETS else None,
+                    "tag": args.tag or None,
                     "seed": args.seed,
                     "n_found": n_found,
                     "n_expected": total,
