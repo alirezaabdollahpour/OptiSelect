@@ -1,139 +1,165 @@
 #!/usr/bin/env python3
 """
-Collect results from all Shakespeare experiments and display a comparison table.
-Usage: python collect_results.py [--results_dir PATH] [--logs_dir PATH]
-"""
+Collect and display results from OptiSelect experiments.
 
+Reads log files (not summary.json) because the two training code paths
+write incompatible summary schemas: standard-mode writes empty history
+lists, selection-mode writes flat final_* scalars and no entropy. The
+logs carry the ground-truth eval metrics and sel_entropy for both modes.
+
+Usage:
+  python collect_results.py --dataset shakespeare
+  python collect_results.py --dataset wikitext
+  python collect_results.py --dataset owt2 --scale full
+  python collect_results.py --dataset slimpajama --scale full --seed 0
+"""
+import argparse
+import json
 import os
 import re
-import json
-import argparse
-from pathlib import Path
 
 
-def parse_log_file(log_path):
-    """Extract final evaluation metrics from a log file."""
-    results = {
-        "final_val_loss": None,
-        "final_val_pp": None,
-        "final_val_acc": None,
-        "best_val_loss": float("inf"),
-        "selection_entropy": None,
-    }
+DATASET_DISPLAY = {
+    "shakespeare": "Shakespeare-Char",
+    "wikitext": "WikiText-103",
+    "owt2": "OpenWebText2",
+    "slimpajama": "SlimPajama",
+}
+SCALED_DATASETS = {"owt2", "slimpajama"}
 
-    if not os.path.exists(log_path):
-        return results
+OPTIMIZERS = ["adamw", "ademamix", "d-muon", "mars", "sophiag", "soap",
+              "lion", "signum", "adopt", "sgd"]
+DISPLAY = {
+    "adamw": "AdamW", "ademamix": "AdEMAMix", "d-muon": "D-Muon",
+    "mars": "MARS", "sophiag": "Sophia", "soap": "SOAP",
+    "lion": "Lion", "signum": "Signum", "adopt": "ADOPT", "sgd": "SGD",
+}
+MODES = ["standard", "selection"]
 
-    with open(log_path, "r") as f:
-        lines = f.readlines()
 
-    for line in lines:
-        # Match eval lines: ">Eval: Iter=1000 ... val_loss=2.345 val_pp=10.43 val_acc=0.234"
-        # or ">Eval [Selection]: ..."
-        eval_match = re.search(
-            r">Eval.*val_loss=([0-9.]+)\s+val_pp=([0-9.]+)\s+val_acc=([0-9.]+)", line
-        )
-        if eval_match:
-            vl = float(eval_match.group(1))
-            vp = float(eval_match.group(2))
-            va = float(eval_match.group(3))
-            results["final_val_loss"] = vl
-            results["final_val_pp"] = vp
-            results["final_val_acc"] = va
-            if vl < results["best_val_loss"]:
-                results["best_val_loss"] = vl
+def log_filename(dataset, scale, mode, opt, seed):
+    if dataset in SCALED_DATASETS:
+        return f"{mode}_{dataset}_{scale}_{opt}_seed{seed}.log"
+    return f"{mode}_{dataset}_{opt}_seed{seed}.log"
 
-        # Match selection entropy
-        entropy_match = re.search(r"sel_entropy=([0-9.]+)", line)
-        if entropy_match:
-            results["selection_entropy"] = float(entropy_match.group(1))
 
-    if results["best_val_loss"] == float("inf"):
-        results["best_val_loss"] = None
-
-    return results
+def parse_log(path):
+    r = {"val_loss": None, "val_pp": None, "val_acc": None, "entropy": None}
+    if not os.path.exists(path):
+        return r
+    entropies = []
+    eval_re = re.compile(
+        r">Eval[^\n]*?val_loss=([0-9.]+)\s+val_pp=([0-9.]+)\s+val_acc=([0-9.]+)"
+    )
+    ent_re = re.compile(r"sel_entropy=([0-9.]+)")
+    with open(path, errors="replace") as f:
+        for line in f:
+            # Last >Eval wins — final metrics
+            m = eval_re.search(line)
+            if m:
+                r["val_loss"] = float(m.group(1))
+                r["val_pp"] = float(m.group(2))
+                r["val_acc"] = float(m.group(3))
+            for e in ent_re.finditer(line):
+                entropies.append(float(e.group(1)))
+    if entropies:
+        r["entropy"] = sum(entropies) / len(entropies)
+    return r
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", required=True, choices=list(DATASET_DISPLAY))
+    ap.add_argument("--scale", default="full",
+                    help="only used for owt2/slimpajama (small|full)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
         "--logs_dir",
         default="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src/logs",
     )
-    args = parser.parse_args()
+    args = ap.parse_args()
 
-    optimizers = [
-        "adamw",
-        "ademamix",
-        "d-muon",
-        "mars",
-        "sophiag",
-        "soap",
-        "lion",
-        "signum",
-        "adopt",
-        "sgd",
-    ]
-    modes = ["standard", "selection"]
+    results = {}
+    n_found = 0
+    for opt in OPTIMIZERS:
+        results[opt] = {}
+        for mode in MODES:
+            path = os.path.join(
+                args.logs_dir,
+                log_filename(args.dataset, args.scale, mode, opt, args.seed),
+            )
+            r = parse_log(path)
+            results[opt][mode] = r
+            if r["val_loss"] is not None:
+                n_found += 1
 
-    # Collect results
-    all_results = {}
-    for opt in optimizers:
-        all_results[opt] = {}
-        for mode in modes:
-            # log_path = os.path.join(args.logs_dir, f"{mode}_shakespeare_{opt}.log")
-            log_path = os.path.join(args.logs_dir, f"{mode}_wikitext_{opt}_seed0.log")
-            all_results[opt][mode] = parse_log_file(log_path)
-
-    # Print table
+    name = DATASET_DISPLAY[args.dataset]
+    scale_note = f" [{args.scale}]" if args.dataset in SCALED_DATASETS else ""
+    total = len(OPTIMIZERS) * len(MODES)
     print()
-    print("=" * 100)
-    print(
-        "  OptiSelect WikiText Results: Standard vs Selection"
+    print("=" * 130)
+    print(f"  {name}{scale_note} Results: Standard vs OptiSelect (seed {args.seed})")
+    print(f"  Found {n_found}/{total} runs")
+    print("=" * 130)
+
+    hdr = (
+        f"{'Optimizer':<12} | {'Std Loss':>10} {'Std PP':>10} {'Std Acc%':>10} | "
+        f"{'Sel Loss':>10} {'Sel PP':>10} {'Sel Acc%':>10} | "
+        f"{'ΔLoss':>8} {'ΔAcc':>8} {'H_sel':>6}"
     )
-    print("=" * 100)
-    print()
+    print(hdr)
+    print("-" * len(hdr))
 
-    # Header
-    header = f"{'Optimizer':<12} | {'Standard Loss':>14} {'Std PP':>10} {'Std Acc':>10} | {'Select Loss':>14} {'Sel PP':>10} {'Sel Acc':>10} | {'Δ Loss':>8} {'Entropy':>8}"
-    print(header)
-    print("-" * len(header))
-
-    for opt in optimizers:
-        std = all_results[opt]["standard"]
-        sel = all_results[opt]["selection"]
-
-        std_loss = f"{std['final_val_loss']:.4f}" if std["final_val_loss"] else "  N/A"
-        std_pp = f"{std['final_val_pp']:.3f}" if std["final_val_pp"] else "  N/A"
-        std_acc = f"{std['final_val_acc']:.4f}" if std["final_val_acc"] else "  N/A"
-
-        sel_loss = f"{sel['final_val_loss']:.4f}" if sel["final_val_loss"] else "  N/A"
-        sel_pp = f"{sel['final_val_pp']:.3f}" if sel["final_val_pp"] else "  N/A"
-        sel_acc = f"{sel['final_val_acc']:.4f}" if sel["final_val_acc"] else "  N/A"
-
-        if std["final_val_loss"] and sel["final_val_loss"]:
-            delta = sel["final_val_loss"] - std["final_val_loss"]
-            delta_str = f"{delta:+.4f}"
-        else:
-            delta_str = "  N/A"
-
-        entropy_str = (
-            f"{sel['selection_entropy']:.2f}" if sel["selection_entropy"] else "  N/A"
+    for opt in OPTIMIZERS:
+        s = results[opt]["standard"]
+        x = results[opt]["selection"]
+        disp = DISPLAY.get(opt, opt)
+        sl = f"{s['val_loss']:.3f}" if s["val_loss"] is not None else "    —"
+        sp = f"{s['val_pp']:.2f}" if s["val_pp"] is not None else "    —"
+        sa = f"{100*s['val_acc']:.2f}" if s["val_acc"] is not None else "    —"
+        xl = f"{x['val_loss']:.3f}" if x["val_loss"] is not None else "    —"
+        xp = f"{x['val_pp']:.2f}" if x["val_pp"] is not None else "    —"
+        xa = f"{100*x['val_acc']:.2f}" if x["val_acc"] is not None else "    —"
+        dl = (
+            f"{x['val_loss']-s['val_loss']:+.3f}"
+            if (s["val_loss"] is not None and x["val_loss"] is not None)
+            else "    —"
         )
-
+        da = (
+            f"{100*(x['val_acc']-s['val_acc']):+.2f}"
+            if (s["val_acc"] is not None and x["val_acc"] is not None)
+            else "    —"
+        )
+        en = f"{x['entropy']:.2f}" if x["entropy"] is not None else "   —"
         print(
-            f"{opt:<12} | {std_loss:>14} {std_pp:>10} {std_acc:>10} | {sel_loss:>14} {sel_pp:>10} {sel_acc:>10} | {delta_str:>8} {entropy_str:>8}"
+            f"{disp:<12} | {sl:>10} {sp:>10} {sa:>10} | "
+            f"{xl:>10} {xp:>10} {xa:>10} | {dl:>8} {da:>8} {en:>6}"
         )
-
     print()
-    print("Δ Loss < 0 means selection IMPROVED over standard training")
-    print()
+    print("ΔLoss < 0 → selection improved | ΔAcc > 0 → selection improved")
+    print("H_sel     → mean sel_entropy across training (higher = more diverse)")
 
-    # Save as JSON
-    json_path = os.path.join(args.logs_dir, "wikitext_results_summary.json")
-    with open(json_path, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"Results saved to: {json_path}")
+    suffix = f"_{args.scale}" if args.dataset in SCALED_DATASETS else ""
+    out = os.path.join(
+        args.logs_dir,
+        f"{args.dataset}{suffix}_results_seed{args.seed}.json",
+    )
+    with open(out, "w") as f:
+        json.dump(
+            {
+                "metadata": {
+                    "dataset": args.dataset,
+                    "scale": args.scale if args.dataset in SCALED_DATASETS else None,
+                    "seed": args.seed,
+                    "n_found": n_found,
+                    "n_expected": total,
+                },
+                "results": results,
+            },
+            f,
+            indent=2,
+        )
+    print(f"\nSaved: {out}")
 
 
 if __name__ == "__main__":
