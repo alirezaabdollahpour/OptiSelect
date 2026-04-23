@@ -48,9 +48,17 @@
 #   Val proxy: 512 docs (scaled for WikiText), refresh every 3,000 steps
 #
 # Expected runtime: ~15-20 min per run × 20 runs ≈ 5-7 hours on 1×A100
+#
+# Usage:
+#   bash run_wikitext_exp.sh [NPROC]
+# Each optimizer run uses DDP across NPROC GPUs (default 4). The nccl
+# backend auto-divides batch_size*acc_steps across ranks, so effective
+# batch is preserved — runs are just ~NPROC× faster.
 # =============================================================================
 
 # Do NOT use `set -e` — per-optimizer failures should not cascade
+
+NPROC=${1:-4}   # GPUs per run (DDP world size)
 
 # ---- Paths ----
 SRC_DIR="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src"
@@ -97,6 +105,7 @@ DATA_ARGS="--dataset wikitext --datasets_dir ${DATASETS_DIR}"
 COMMON_ARGS="--iterations ${ITERS} --warmup_steps ${WARMUP_STEPS} --scheduler cos"
 COMMON_ARGS="${COMMON_ARGS} --grad_clip ${GRAD_CLIP} --weight_decay ${WEIGHT_DECAY}"
 COMMON_ARGS="${COMMON_ARGS} --dropout 0.0 --dtype bfloat16 --device cuda:0"
+COMMON_ARGS="${COMMON_ARGS} --distributed_backend nccl"
 
 EVAL_ARGS="--eval_interval ${EVAL_INTERVAL} --log_interval ${LOG_INTERVAL}"
 EVAL_ARGS="${EVAL_ARGS} --eval_batches ${EVAL_BATCHES}"
@@ -147,7 +156,7 @@ assert 'final_val_loss' in d and d['final_val_loss'] is not None
 
     echo ""
     echo "================================================================"
-    echo "  Optimizer: ${OPT_NAME} | Mode: ${MODE} | Seed: ${SEED}"
+    echo "  Optimizer: ${OPT_NAME} | Mode: ${MODE} | Seed: ${SEED} | GPUs: ${NPROC}"
     echo "  Iters: ${ITERS} | Warmup: ${WARMUP_STEPS} | Batch: $(echo $BATCH_OVERRIDE)"
     if [ "$MODE" == "selection" ]; then
         echo "  Selection: B̃/B=${CAND_MULT}, τ=${SEL_TEMP}, λ_r=${SEL_REDUNDANCY}"
@@ -161,7 +170,7 @@ assert 'final_val_loss' in d and d['final_val_loss'] is not None
         SEL_FLAG="$SEL_ARGS"
     fi
 
-    python main.py \
+    torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC} main.py \
         $MODEL_ARGS \
         $DATA_ARGS \
         $BATCH_OVERRIDE \
@@ -191,7 +200,7 @@ assert 'final_val_loss' in d and d['final_val_loss'] is not None
 echo ""
 echo "================================================================"
 echo "  OptiSelect WikiText-103 Benchmark (v3 — Paper-Aligned)"
-echo "  10 optimizers × 2 modes = 20 runs | Seed: ${SEED}"
+echo "  10 optimizers × 2 modes = 20 runs | Seed: ${SEED} | DDP GPUs: ${NPROC}"
 echo "  Model: ~25M params (Llama, n_embd=384)"
 echo "  Training: ${ITERS} iters × 8192 tok ≈ 98M tokens"
 echo "  Started: $(date)"

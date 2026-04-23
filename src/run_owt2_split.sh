@@ -27,27 +27,26 @@
 #     Selection: 19,000 iters × 2× candidates → same compute budget
 #
 # Usage:
-#   bash run_owt2_split.sh [SPLIT_ID] [SCALE] [SEED]
+#   bash run_owt2_split.sh [SPLIT_ID] [SCALE] [SEED] [NPROC]
 #
-#   # Single sequential run (all optimizers):
-#   bash run_owt2_split.sh 0 small 0
+# Each optimizer run uses DDP across NPROC GPUs (default 4). The nccl
+# backend auto-divides batch_size*acc_steps across ranks, so effective
+# batch is preserved — runs are just ~NPROC× faster.
 #
-#   # Parallel (5 jobs, each runs 2 optimizers):
-#   for i in 1 2 3 4 5; do bash run_owt2_split.sh $i full 0; done
-#
-# Launch as parallel training jobs from WSL:
+# Launch as parallel training jobs from WSL (4 GPUs per run):
 #   for i in 1 2 3 4 5; do
-#     python csub.py -n owt2-$i -g 1 -t 3d --train \
+#     python csub.py -n owt2-$i -g 4 -t 3d --train \
 #       --command "cd /mloscratch/homes/aabdolla/llm-optimizer-benchmark/src && \
 #         source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
 #         export PYTHONPATH=/mloscratch/homes/aabdolla/GhostSuite:/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src:\$PYTHONPATH && \
-#         bash run_owt2_split.sh $i full 0"
+#         bash run_owt2_split.sh \$i full 0 4"
 #   done
 # =============================================================================
 
 SPLIT=${1:-0}       # 0=all sequential, 1-5=parallel splits
 SCALE=${2:-small}
 SEED=${3:-0}
+NPROC=${4:-4}       # GPUs per run (DDP world size)
 
 # ---- Paths ----
 SRC_DIR="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src"
@@ -107,7 +106,7 @@ fi
 
 # ---- Common args ----
 DATA_ARGS="--dataset openwebtext2 --datasets_dir ${DATASETS_DIR}"
-COMMON="--scheduler cos --grad_clip 1.0 --weight_decay 0.1 --dropout 0.0 --dtype bfloat16 --device cuda:0"
+COMMON="--scheduler cos --grad_clip 1.0 --weight_decay 0.1 --dropout 0.0 --dtype bfloat16 --device cuda:0 --distributed_backend nccl"
 EVAL_ARGS="--eval_interval ${EVAL_INTERVAL} --log_interval ${LOG_INTERVAL}"
 RESULTS_ARGS="--results_base_folder ${RESULTS_DIR}"
 SEL_ARGS="--selection --candidate_multiplier 2 --selection_temperature 0.1 --selection_sketch_dim 1024 --val_proxy_refresh 5000"
@@ -146,7 +145,7 @@ run_experiment() {
 
     echo ""
     echo "============================================================"
-    echo "  ${OPT_NAME} | ${MODE} | owt2-${SCALE} | seed=${SEED}"
+    echo "  ${OPT_NAME} | ${MODE} | owt2-${SCALE} | seed=${SEED} | GPUs=${NPROC}"
     echo "  Iters: ${ITERS} | Warmup: ${WARMUP}"
     [ "$MODE" == "selection" ] && echo "  Selection: τ=0.1, 2× candidates"
     echo "  Started: $(date)"
@@ -155,7 +154,7 @@ run_experiment() {
     local SEL_FLAG=""
     [ "$MODE" == "selection" ] && SEL_FLAG="$SEL_ARGS"
 
-    python main.py \
+    torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC} main.py \
         $MODEL_ARGS \
         $DATA_ARGS \
         $BATCH_OVR \
@@ -204,7 +203,7 @@ run_sgd()      { run_experiment "sgd"      "$1" "--opt sgd"      "--lr 3e-2 --mo
 echo ""
 echo "================================================================"
 echo "  OptiSelect OpenWebText2 | Split: ${SPLIT} | Scale: ${SCALE}"
-echo "  ${DESCRIPTION} | Seed: ${SEED}"
+echo "  ${DESCRIPTION} | Seed: ${SEED} | DDP GPUs: ${NPROC}"
 echo "  Started: $(date)"
 echo "================================================================"
 echo ""
