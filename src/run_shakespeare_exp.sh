@@ -75,13 +75,31 @@ SEED=${1:-0}
 NPROC=${2:-4}   # GPUs per run (DDP world size)
 TAG=${3:-}      # optional suffix for isolating this variant's outputs
 
+# ---- Validation-proxy source for OptiSelect ----
+# PROXY_SOURCE=train (default) or downstream (mixture of HellaSwag/ARC-E/
+# ARC-C/PIQA/SciQ). Shakespeare-Char uses a 95-char vocabulary, so the
+# downstream proxy (GPT-2 BPE bins) is incompatible — Python will raise a
+# clear error if the user sets PROXY_SOURCE=downstream for this script.
+PROXY_SOURCE=${PROXY_SOURCE:-train}
+PROXY_TASKS=${PROXY_TASKS:-hellaswag,arc_easy,arc_challenge,piqa,sciq}
+if [ "$PROXY_SOURCE" != "train" ]; then
+    echo "[WARN] PROXY_SOURCE=${PROXY_SOURCE} with Shakespeare-Char (vocab=95)."
+    echo "       Downstream task bins are GPT-2 BPE (vocab=50257) and will be"
+    echo "       rejected by the Python runtime. Override the model vocab or"
+    echo "       set PROXY_SOURCE=train."
+fi
+
 # ---- Paths ----
 SRC_DIR="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src"
 DATASETS_DIR="/mloscratch/homes/aabdolla/datasets"
+PROXY_SUFFIX=""
+if [ "$PROXY_SOURCE" != "train" ]; then
+    PROXY_SUFFIX="_proxy-${PROXY_SOURCE}"
+fi
 if [ -n "$TAG" ]; then
-    RESULTS_DIR="/mloscratch/homes/aabdolla/results/shakespeare_exp_${TAG}"
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/shakespeare_exp_${TAG}${PROXY_SUFFIX}"
 else
-    RESULTS_DIR="/mloscratch/homes/aabdolla/results/shakespeare_exp"
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/shakespeare_exp${PROXY_SUFFIX}"
 fi
 
 cd "$SRC_DIR"
@@ -92,7 +110,7 @@ export HF_DATASETS_CACHE=/mloscratch/homes/aabdolla/.hf_cache/datasets
 
 # Memory safety environment
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export SEED RESULTS_DIR TAG
+export SEED RESULTS_DIR TAG PROXY_SOURCE
 
 mkdir -p "$RESULTS_DIR" logs
 
@@ -181,6 +199,8 @@ SEL_ARGS="${SEL_ARGS} --selection_sketch_dim ${SEL_SKETCH}"
 SEL_ARGS="${SEL_ARGS} --selection_redundancy_weight ${SEL_REDUNDANCY}"
 SEL_ARGS="${SEL_ARGS} --val_proxy_size ${VAL_PROXY_SIZE}"
 SEL_ARGS="${SEL_ARGS} --val_proxy_refresh ${VAL_PROXY_REFRESH}"
+SEL_ARGS="${SEL_ARGS} --val_proxy_source ${PROXY_SOURCE}"
+SEL_ARGS="${SEL_ARGS} --val_proxy_tasks ${PROXY_TASKS}"
 
 SOPHIA_BS=32
 
@@ -199,8 +219,16 @@ run_experiment() {
     local BATCH_OVR=${5:-$BATCH}
 
     local EXP_NAME
-    if [ -n "$TAG" ]; then
-        EXP_NAME="${MODE}_shakespeare_${TAG}_${OPT_NAME}_seed${SEED}"
+    local FULL_TAG="${TAG}"
+    if [ "$PROXY_SOURCE" != "train" ]; then
+        if [ -n "$FULL_TAG" ]; then
+            FULL_TAG="${FULL_TAG}_proxy-${PROXY_SOURCE}"
+        else
+            FULL_TAG="proxy-${PROXY_SOURCE}"
+        fi
+    fi
+    if [ -n "$FULL_TAG" ]; then
+        EXP_NAME="${MODE}_shakespeare_${FULL_TAG}_${OPT_NAME}_seed${SEED}"
     else
         EXP_NAME="${MODE}_shakespeare_${OPT_NAME}_seed${SEED}"
     fi
@@ -332,6 +360,8 @@ echo "  Model: ~2M params (Llama: n_embd=256, n_head=8, n_layer=4)"
 echo "  Vocab: 95 chars (character-level, not BPE)"
 echo "  Training: ${ITERS} iters × 16K tok ≈ 49M tokens"
 echo "  Alloc: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+echo "  Proxy source: ${PROXY_SOURCE}$([ "$PROXY_SOURCE" != "train" ] && echo " [${PROXY_TASKS}]")"
+echo "  Results dir:  ${RESULTS_DIR}"
 echo "  Started: $(date)"
 echo "================================================================"
 
@@ -500,6 +530,12 @@ SEED = int(os.environ.get("SEED", "0"))
 RESULTS_DIR = os.environ.get("RESULTS_DIR",
     "/mloscratch/homes/aabdolla/results/shakespeare_exp")
 LOG_DIR = "logs"
+PROXY_SOURCE = os.environ.get("PROXY_SOURCE", "train")
+TAG = os.environ.get("TAG", "")
+_full_tag = TAG
+if PROXY_SOURCE != "train":
+    _full_tag = f"{TAG}_proxy-{PROXY_SOURCE}" if TAG else f"proxy-{PROXY_SOURCE}"
+NAME_INFIX = f"{_full_tag}_" if _full_tag else ""
 
 optimizers = ["adamw", "ademamix", "d-muon", "mars", "sophiag", "soap",
               "lion", "signum", "adopt", "sgd"]
@@ -516,7 +552,7 @@ for opt in optimizers:
     results[opt] = {}
     for mode in modes:
         p = os.path.join(RESULTS_DIR,
-                         f"{mode}_shakespeare_{opt}_seed{SEED}",
+                         f"{mode}_shakespeare_{NAME_INFIX}{opt}_seed{SEED}",
                          "summary.json")
         r = {"val_loss": None, "val_pp": None, "val_acc": None, "entropy": None}
         if os.path.exists(p):
@@ -606,7 +642,8 @@ print(r"\bottomrule")
 print(r"\end{tabular}")
 print(r"\end{table}")
 
-out = os.path.join(LOG_DIR, f"shakespeare_results_seed{SEED}.json")
+_outsuffix = f"_{_full_tag}" if _full_tag else ""
+out = os.path.join(LOG_DIR, f"shakespeare_results_seed{SEED}{_outsuffix}.json")
 with open(out, "w") as f:
     json.dump({
         "metadata": {

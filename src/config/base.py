@@ -366,6 +366,23 @@ def parse_args(base_parser, args, namespace):
         help="Paper Appendix C: proxy resampling interval in steps (default: 5000)",
     )
     parser.add_argument(
+        "--val_proxy_source",
+        default="train",
+        type=str,
+        choices=["train", "downstream"],
+        help="Source distribution for the OptiSelect validation gradient proxy. "
+             "'train' (default): draw from the training dataset's val split "
+             "(Paper Appendix C). 'downstream': mixture of HellaSwag/ARC-E/"
+             "ARC-C/PIQA/SciQ (task-aware alignment signal; requires GPT-2 BPE).",
+    )
+    parser.add_argument(
+        "--val_proxy_tasks",
+        default="hellaswag,arc_easy,arc_challenge,piqa,sciq",
+        type=str,
+        help="Comma-separated downstream tasks used when "
+             "--val_proxy_source=downstream (default: all five).",
+    )
+    parser.add_argument(
         "--selection_geometry_override",
         default=None,
         type=str,

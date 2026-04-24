@@ -60,16 +60,27 @@
 
 NPROC=${1:-4}   # GPUs per run (DDP world size)
 
+# ---- Validation-proxy source for OptiSelect ----
+# PROXY_SOURCE=train (default, Paper Appendix C) or downstream (mixture
+# of HellaSwag/ARC-E/ARC-C/PIQA/SciQ). Downstream requires GPT-2 BPE.
+PROXY_SOURCE=${PROXY_SOURCE:-train}
+PROXY_TASKS=${PROXY_TASKS:-hellaswag,arc_easy,arc_challenge,piqa,sciq}
+
 # ---- Paths ----
 SRC_DIR="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src"
 DATASETS_DIR="/mloscratch/homes/aabdolla/datasets"
-RESULTS_DIR="/mloscratch/homes/aabdolla/results/wikitext_exp_v3"
+if [ "$PROXY_SOURCE" = "train" ]; then
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/wikitext_exp_v3"
+else
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/wikitext_exp_v3_proxy_${PROXY_SOURCE}"
+fi
 
 cd "$SRC_DIR"
 source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate
 export PYTHONPATH="/mloscratch/homes/aabdolla/GhostSuite:${SRC_DIR}:$PYTHONPATH"
 export HF_HOME=/mloscratch/homes/aabdolla/.hf_cache
 export HF_DATASETS_CACHE=/mloscratch/homes/aabdolla/.hf_cache/datasets
+export PROXY_SOURCE RESULTS_DIR
 
 mkdir -p "$RESULTS_DIR" logs
 
@@ -118,6 +129,8 @@ SEL_ARGS="${SEL_ARGS} --selection_sketch_dim ${SEL_SKETCH}"
 SEL_ARGS="${SEL_ARGS} --selection_redundancy_weight ${SEL_REDUNDANCY}"
 SEL_ARGS="${SEL_ARGS} --val_proxy_size ${VAL_PROXY_SIZE}"
 SEL_ARGS="${SEL_ARGS} --val_proxy_refresh ${VAL_PROXY_REFRESH}"
+SEL_ARGS="${SEL_ARGS} --val_proxy_source ${PROXY_SOURCE}"
+SEL_ARGS="${SEL_ARGS} --val_proxy_tasks ${PROXY_TASKS}"
 
 BATCH="--batch_size ${BATCH_SIZE} --sequence_length ${SEQ_LEN} --acc_steps ${ACC_STEPS}"
 SOPHIA_BATCH="--batch_size 8 --sequence_length ${SEQ_LEN} --acc_steps 2"
@@ -136,7 +149,12 @@ run_experiment() {
     local OPT_EXTRA=$4
     local BATCH_OVERRIDE=${5:-$BATCH}
 
-    local EXP_NAME="${MODE}_wikitext_${OPT_NAME}_seed${SEED}"
+    local EXP_NAME
+    if [ "$PROXY_SOURCE" = "train" ]; then
+        EXP_NAME="${MODE}_wikitext_${OPT_NAME}_seed${SEED}"
+    else
+        EXP_NAME="${MODE}_wikitext_proxy-${PROXY_SOURCE}_${OPT_NAME}_seed${SEED}"
+    fi
     local LOG_FILE="logs/${EXP_NAME}.log"
 
     # Skip only if summary has final_val_loss (not just partial history)
@@ -203,6 +221,8 @@ echo "  OptiSelect WikiText-103 Benchmark (v3 — Paper-Aligned)"
 echo "  10 optimizers × 2 modes = 20 runs | Seed: ${SEED} | DDP GPUs: ${NPROC}"
 echo "  Model: ~25M params (Llama, n_embd=384)"
 echo "  Training: ${ITERS} iters × 8192 tok ≈ 98M tokens"
+echo "  Proxy source: ${PROXY_SOURCE}$([ "$PROXY_SOURCE" != "train" ] && echo " [${PROXY_TASKS}]")"
+echo "  Results dir:  ${RESULTS_DIR}"
 echo "  Started: $(date)"
 echo "================================================================"
 
@@ -393,6 +413,8 @@ import os, re, json
 LOG_DIR = "logs"
 RESULTS_DIR = os.environ.get("RESULTS_DIR",
     "/mloscratch/homes/aabdolla/results/wikitext_exp_v3")
+PROXY_SOURCE = os.environ.get("PROXY_SOURCE", "train")
+NAME_INFIX = "" if PROXY_SOURCE == "train" else f"proxy-{PROXY_SOURCE}_"
 
 optimizers = ["adamw", "ademamix", "d-muon", "mars", "sophiag", "soap",
               "lion", "signum", "adopt", "sgd"]
@@ -420,9 +442,9 @@ results = {}
 for opt in optimizers:
     results[opt] = {}
     for mode in modes:
-        log_path = os.path.join(LOG_DIR, f"{mode}_wikitext_{opt}_seed{seed}.log")
+        log_path = os.path.join(LOG_DIR, f"{mode}_wikitext_{NAME_INFIX}{opt}_seed{seed}.log")
         summary_path = os.path.join(RESULTS_DIR,
-                                    f"{mode}_wikitext_{opt}_seed{seed}",
+                                    f"{mode}_wikitext_{NAME_INFIX}{opt}_seed{seed}",
                                     "summary.json")
 
         r = {"val_loss": None, "val_pp": None, "val_acc": None,
@@ -554,7 +576,8 @@ print(r"\end{tabular}")
 print(r"\end{table}")
 
 # ---- Save structured JSON ----
-out = os.path.join(LOG_DIR, "wikitext_results_v3.json")
+suffix = "" if PROXY_SOURCE == "train" else f"_proxy-{PROXY_SOURCE}"
+out = os.path.join(LOG_DIR, f"wikitext_results_v3{suffix}.json")
 with open(out, "w") as f:
     json.dump({
         "metadata": {

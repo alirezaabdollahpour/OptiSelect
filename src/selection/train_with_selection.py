@@ -91,6 +91,16 @@ def train_with_selection(
     redundancy_weight = getattr(cfg, "selection_redundancy_weight", 1.0)
     val_proxy_size = getattr(cfg, "val_proxy_size", 4096)
     val_proxy_refresh = getattr(cfg, "val_proxy_refresh", 5000)
+    val_proxy_source = getattr(cfg, "val_proxy_source", "train")
+    val_proxy_tasks = [
+        t.strip()
+        for t in getattr(
+            cfg,
+            "val_proxy_tasks",
+            "hellaswag,arc_easy,arc_challenge,piqa,sciq",
+        ).split(",")
+        if t.strip()
+    ]
 
     B = cfg.batch_size
     B_cand = B * candidate_multiplier
@@ -112,19 +122,48 @@ def train_with_selection(
     val_reader = datareaders["val"]
 
     # ------------------------------------------------------------------
-    # Build validation proxy (Paper Appendix C: 4,096 documents)
-    # Uses val_reader's NATIVE batch_size; we draw enough batches to cover
-    # val_proxy_size documents.
+    # Build validation proxy (Paper Appendix C: 4,096 documents by default,
+    # drawn from the training dataset's val split). When
+    # cfg.val_proxy_source == "downstream", the proxy is instead drawn from
+    # a mixture of held-out multiple-choice benchmark tasks (HellaSwag,
+    # ARC-Easy, ARC-Challenge, PIQA, SciQ) — a task-aware alignment signal.
     # ------------------------------------------------------------------
+    proxy_refresh_count = 0
+    base_seed = int(getattr(cfg, "seed", 0))
+
+    if val_proxy_source == "downstream":
+        from selection.downstream_proxy import build_downstream_proxy_batches
+
     def build_val_proxy():
         """Draw a fresh val_proxy_size-document proxy set."""
-        val_reader.set_step(0)
-        reader_bs = val_reader.batch_size
-        n_batches = max(1, (val_proxy_size + reader_bs - 1) // reader_bs)
-        batches = []
-        for _ in range(n_batches):
-            vx, vy = get_batch(val_reader, device=device)
-            batches.append((vx, vy))
+        nonlocal proxy_refresh_count
+        if val_proxy_source == "train":
+            val_reader.set_step(0)
+            reader_bs = val_reader.batch_size
+            n_batches = max(1, (val_proxy_size + reader_bs - 1) // reader_bs)
+            batches = []
+            for _ in range(n_batches):
+                vx, vy = get_batch(val_reader, device=device)
+                batches.append((vx, vy))
+            proxy_refresh_count += 1
+            return batches
+
+        # Downstream task-mixture proxy
+        rng = np.random.default_rng(
+            base_seed + 10_000 * (proxy_refresh_count + 1)
+        )
+        batches, counts = build_downstream_proxy_batches(
+            tasks=val_proxy_tasks,
+            n_docs=val_proxy_size,
+            batch_size=val_reader.batch_size,
+            sequence_length=cfg.sequence_length,
+            device=device,
+            rng=rng,
+            vocab_size=int(getattr(cfg, "vocab_size", 50304)),
+        )
+        per_task_str = ", ".join(f"{t}:{n}" for t, n in counts.items())
+        print(f"[OptiSelect] Downstream proxy composition — {per_task_str}")
+        proxy_refresh_count += 1
         return batches
 
     val_proxy_batches = build_val_proxy()
@@ -171,6 +210,9 @@ def train_with_selection(
     print(f"  Redundancy weight:    {redundancy_weight}")
     print(f"  Val proxy size:       {val_proxy_size} (actual: {actual_proxy_docs})")
     print(f"  Val proxy refresh:    every {val_proxy_refresh} steps")
+    print(f"  Val proxy source:     {val_proxy_source}"
+          + (f" [{', '.join(val_proxy_tasks)}]"
+             if val_proxy_source == "downstream" else ""))
     print(f"  Strategy:             Concatenate {candidate_multiplier} "
           f"batches of {B} (no batch_size mutation)\n")
 
@@ -370,6 +412,11 @@ def train_with_selection(
                         "temperature": temperature,
                         "val_proxy_size": val_proxy_size,
                         "val_proxy_refresh": val_proxy_refresh,
+                        "val_proxy_source": val_proxy_source,
+                        "val_proxy_tasks": (
+                            val_proxy_tasks
+                            if val_proxy_source == "downstream" else None
+                        ),
                         "redundancy_weight": redundancy_weight,
                     },
                 }, f, indent=2)
