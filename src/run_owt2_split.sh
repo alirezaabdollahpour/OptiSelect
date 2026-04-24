@@ -48,10 +48,20 @@ SCALE=${2:-small}
 SEED=${3:-0}
 NPROC=${4:-4}       # GPUs per run (DDP world size)
 
+# ---- Validation-proxy source for OptiSelect ----
+# PROXY_SOURCE=train (default, Paper Appendix C) or downstream (mixture
+# of HellaSwag/ARC-E/ARC-C/PIQA/SciQ). Downstream requires GPT-2 BPE.
+PROXY_SOURCE=${PROXY_SOURCE:-train}
+PROXY_TASKS=${PROXY_TASKS:-hellaswag,arc_easy,arc_challenge,piqa,sciq}
+
 # ---- Paths ----
 SRC_DIR="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src"
 DATASETS_DIR="/mloscratch/homes/aabdolla/datasets"
-RESULTS_DIR="/mloscratch/homes/aabdolla/results/owt2_exp_${SCALE}"
+if [ "$PROXY_SOURCE" = "train" ]; then
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/owt2_exp_${SCALE}"
+else
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/owt2_exp_${SCALE}_proxy_${PROXY_SOURCE}"
+fi
 
 cd "$SRC_DIR"
 source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate
@@ -59,6 +69,7 @@ export PYTHONPATH="/mloscratch/homes/aabdolla/GhostSuite:${SRC_DIR}:$PYTHONPATH"
 export HF_HOME=/mloscratch/homes/aabdolla/.hf_cache
 export HF_DATASETS_CACHE=/mloscratch/homes/aabdolla/.hf_cache/datasets
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PROXY_SOURCE RESULTS_DIR
 
 mkdir -p "$RESULTS_DIR" logs
 
@@ -111,6 +122,14 @@ COMMON="--scheduler cos --grad_clip 1.0 --weight_decay 0.1 --dropout 0.0 --dtype
 EVAL_ARGS="--eval_interval ${EVAL_INTERVAL} --log_interval ${LOG_INTERVAL}"
 RESULTS_ARGS="--results_base_folder ${RESULTS_DIR}"
 SEL_ARGS="--selection --candidate_multiplier 2 --selection_temperature 0.1 --selection_sketch_dim 1024 --val_proxy_refresh 5000"
+SEL_ARGS="${SEL_ARGS} --val_proxy_source ${PROXY_SOURCE} --val_proxy_tasks ${PROXY_TASKS}"
+# Chunk the candidate forward/backward: the full-scale 128-candidate CE
+# softmax would materialize ~13 GB fp32 logits. Processing in
+# candidate_multiplier chunks of batch_size halves it. For full scale we
+# set this explicitly to batch_size / 2 for extra headroom.
+if [ "$SCALE" == "full" ]; then
+    SEL_ARGS="${SEL_ARGS} --candidate_chunk_size 32"
+fi
 
 FAILED_RUNS=()
 COMPLETED_RUNS=()
@@ -126,7 +145,12 @@ run_experiment() {
     local OPT_EXTRA=$4
     local BATCH_OVR=${5:-$BATCH}
 
-    local EXP_NAME="${MODE}_owt2_${SCALE}_${OPT_NAME}_seed${SEED}"
+    local EXP_NAME
+    if [ "$PROXY_SOURCE" = "train" ]; then
+        EXP_NAME="${MODE}_owt2_${SCALE}_${OPT_NAME}_seed${SEED}"
+    else
+        EXP_NAME="${MODE}_owt2_${SCALE}_proxy-${PROXY_SOURCE}_${OPT_NAME}_seed${SEED}"
+    fi
     local LOG_FILE="logs/${EXP_NAME}.log"
 
     local ITERS WARMUP
@@ -205,22 +229,27 @@ echo ""
 echo "================================================================"
 echo "  OptiSelect OpenWebText2 | Split: ${SPLIT} | Scale: ${SCALE}"
 echo "  ${DESCRIPTION} | Seed: ${SEED} | DDP GPUs: ${NPROC}"
+echo "  Proxy source: ${PROXY_SOURCE}$([ "$PROXY_SOURCE" != "train" ] && echo " [${PROXY_TASKS}]")"
+echo "  Results dir:  ${RESULTS_DIR}"
 echo "  Started: $(date)"
 echo "================================================================"
 echo ""
 
+#  Selection runs before standard so OOMs / selection-specific failures
+#  surface early instead of after the standard run has already consumed
+#  the wall-clock budget.
 case $SPLIT in
     0)  # All sequential
         for opt in adamw ademamix dmuon mars sophiag soap lion signum adopt sgd; do
-            run_${opt} "standard"
             run_${opt} "selection"
+            run_${opt} "standard"
         done
         ;;
-    1) run_adamw "standard"; run_adamw "selection"; run_ademamix "standard"; run_ademamix "selection" ;;
-    2) run_dmuon "standard"; run_dmuon "selection"; run_mars "standard"; run_mars "selection" ;;
-    3) run_sophiag "standard"; run_sophiag "selection"; run_soap "standard"; run_soap "selection" ;;
-    4) run_lion "standard"; run_lion "selection"; run_signum "standard"; run_signum "selection" ;;
-    5) run_adopt "standard"; run_adopt "selection"; run_sgd "standard"; run_sgd "selection" ;;
+    1) run_adamw "selection"; run_adamw "standard"; run_ademamix "selection"; run_ademamix "standard" ;;
+    2) run_dmuon "selection"; run_dmuon "standard"; run_mars "selection"; run_mars "standard" ;;
+    3) run_sophiag "selection"; run_sophiag "standard"; run_soap "selection"; run_soap "standard" ;;
+    4) run_lion "selection"; run_lion "standard"; run_signum "selection"; run_signum "standard" ;;
+    5) run_adopt "selection"; run_adopt "standard"; run_sgd "selection"; run_sgd "standard" ;;
     *)  echo "Unknown split: $SPLIT (use 0=all, 1-5=parallel)"; exit 1 ;;
 esac
 
@@ -247,6 +276,8 @@ python - << 'PYTHON_SCRIPT'
 import os, re, json
 
 LOG_DIR = "logs"
+PROXY_SOURCE = os.environ.get("PROXY_SOURCE", "train")
+NAME_INFIX = "" if PROXY_SOURCE == "train" else f"proxy-{PROXY_SOURCE}_"
 optimizers = ["adamw", "ademamix", "d-muon", "mars", "sophiag", "soap",
               "lion", "signum", "adopt", "sgd"]
 display = {"adamw": "AdamW", "ademamix": "AdEMAMix", "d-muon": "D-Muon",
@@ -271,7 +302,7 @@ n_found = 0
 for opt in optimizers:
     results[opt] = {}
     for mode in modes:
-        log_path = os.path.join(LOG_DIR, f"{mode}_owt2_{scale_tag}_{opt}_seed{seed}.log")
+        log_path = os.path.join(LOG_DIR, f"{mode}_owt2_{scale_tag}_{NAME_INFIX}{opt}_seed{seed}.log")
         r = {"val_loss": None, "val_pp": None, "val_acc": None, "entropy": None}
         if os.path.exists(log_path):
             with open(log_path) as f:
@@ -363,7 +394,8 @@ print(r"\bottomrule")
 print(r"\end{tabular}")
 print(r"\end{table}")
 
-out = os.path.join(LOG_DIR, f"owt2_{scale_tag}_results_seed{seed}.json")
+_psuffix = "" if PROXY_SOURCE == "train" else f"_proxy-{PROXY_SOURCE}"
+out = os.path.join(LOG_DIR, f"owt2_{scale_tag}_results_seed{seed}{_psuffix}.json")
 with open(out, "w") as f:
     json.dump(results, f, indent=2)
 print(f"\nSaved: {out}")

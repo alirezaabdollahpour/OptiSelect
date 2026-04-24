@@ -101,6 +101,7 @@ def train_with_selection(
         ).split(",")
         if t.strip()
     ]
+    candidate_chunk_size = int(getattr(cfg, "candidate_chunk_size", 0))
 
     B = cfg.batch_size
     B_cand = B * candidate_multiplier
@@ -213,6 +214,11 @@ def train_with_selection(
     print(f"  Val proxy source:     {val_proxy_source}"
           + (f" [{', '.join(val_proxy_tasks)}]"
              if val_proxy_source == "downstream" else ""))
+    _cs = candidate_chunk_size or B
+    _nchunks = (B_cand + _cs - 1) // _cs
+    print(f"  Candidate chunks:     {_nchunks} × {_cs}"
+          f"  (B̃={B_cand}, chunk_size={_cs}"
+          f"{', auto=batch_size' if candidate_chunk_size == 0 else ''})")
     print(f"  Strategy:             Concatenate {candidate_multiplier} "
           f"batches of {B} (no batch_size mutation)\n")
 
@@ -256,21 +262,75 @@ def train_with_selection(
 
         # ==============================================================
         #  2. Forward-backward on candidates -> Ghost factors
+        #
+        #  Chunked to control peak memory: cross-entropy over the full B̃
+        #  materializes (B̃, seq, vocab) fp32 logits during the softmax,
+        #  which at full scale (128 × 512 × 50304) is ~13 GB and OOMs an
+        #  80 GB GPU once the activation graph and Ghost dicts are added.
+        #
+        #  Per-sample Ghost factors (a_z, b_z) depend only on each
+        #  sample's own forward (Linear layers are per-sample in the batch
+        #  dim), so processing B̃ in fixed-size chunks and concatenating
+        #  the factors produces identical scoring — provided chunk_size
+        #  evenly divides B̃ (so reduction='mean's 1/B factor is uniform).
         # ==============================================================
-        engine.start_capture()
-        opt.zero_grad()
-        with type_ctx:
-            outputs = model(cand_x, targets=cand_y)
-        outputs["loss"].backward()
-        engine.stop_capture()
+        chunk_size = candidate_chunk_size or B
+        if actual_B_cand % chunk_size != 0:
+            # Fall back to a divisor of actual_B_cand that is <= chunk_size
+            for cs in range(chunk_size, 0, -1):
+                if actual_B_cand % cs == 0:
+                    chunk_size = cs
+                    break
+            if curr_iter == 0:
+                print(
+                    f"[OptiSelect] Adjusted candidate_chunk_size to "
+                    f"{chunk_size} so it divides B̃={actual_B_cand}"
+                )
 
-        # Hand over Ghost factors from the engine. The hooks will re-populate
-        # fresh dicts on the next capture pass, so a clone here just doubles
-        # peak bf16 memory for no reason.
-        candidate_activations = engine._layer_activations
-        candidate_backprops = engine._layer_backprops
+        engine.start_capture()
+        chunked_a: Dict[str, List[torch.Tensor]] = {}
+        chunked_b: Dict[str, List[torch.Tensor]] = {}
+
+        # Per-chunk loss rescale so per-sample gradients match the
+        # un-chunked mean-over-B̃ case. Without this, reduction='mean'
+        # divides by chunk_size instead of B̃, inflating per-sample
+        # backprops by (B̃ / chunk_size) and throwing off the score scale.
+        loss_scale = float(chunk_size) / float(actual_B_cand)
+
+        for chunk_start in range(0, actual_B_cand, chunk_size):
+            chunk_end = chunk_start + chunk_size
+            cx = cand_x[chunk_start:chunk_end]
+            cy = cand_y[chunk_start:chunk_end]
+
+            opt.zero_grad(set_to_none=True)
+            engine._layer_activations.clear()
+            engine._layer_backprops.clear()
+
+            with type_ctx:
+                out = model(cx, targets=cy)
+            (out["loss"] * loss_scale).backward()
+
+            for name, tensor in engine._layer_activations.items():
+                chunked_a.setdefault(name, []).append(tensor)
+            for name, tensor in engine._layer_backprops.items():
+                chunked_b.setdefault(name, []).append(tensor)
+
+            # Release the local forward graph before the next chunk
+            del out
+
+        engine.stop_capture()
         engine._layer_activations = {}
         engine._layer_backprops = {}
+
+        candidate_activations = {
+            name: torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+            for name, parts in chunked_a.items()
+        }
+        candidate_backprops = {
+            name: torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+            for name, parts in chunked_b.items()
+        }
+        del chunked_a, chunked_b
 
         # Verify candidates captured (should equal actual_B_cand in dim 0)
         if len(candidate_activations) == 0:

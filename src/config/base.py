@@ -383,6 +383,17 @@ def parse_args(base_parser, args, namespace):
              "--val_proxy_source=downstream (default: all five).",
     )
     parser.add_argument(
+        "--candidate_chunk_size",
+        default=0,
+        type=int,
+        help="Chunk size for the candidate forward-backward pass in "
+             "selection mode. 0 (default) = auto-chunk into "
+             "candidate_multiplier chunks of batch_size (no extra memory "
+             "cost at small scales, ~2× savings at full scale). Set a "
+             "smaller positive integer to split further; must evenly "
+             "divide candidate_multiplier × batch_size.",
+    )
+    parser.add_argument(
         "--selection_geometry_override",
         default=None,
         type=str,

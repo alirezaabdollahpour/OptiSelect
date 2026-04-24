@@ -78,7 +78,8 @@ OptiSelect-specific contributions live in:
     └── selection/              # ★ OptiSelect
         ├── influence_scoring.py   # per-optimizer operators O_t
         ├── optiselect_engine.py   # Ghost-factor capture + scoring + sampling
-        └── train_with_selection.py# training loop with selection
+        ├── train_with_selection.py# training loop with selection
+        └── downstream_proxy.py    # task-mixture validation proxy (HellaSwag/ARC/PIQA/SciQ)
 ```
 
 ---
@@ -140,7 +141,55 @@ OptiSelect flags (added to `src/config/base.py`):
 | `--selection_sketch_dim` | `1024` | CountSketch dim (exact scoring at 124M scale) |
 | `--val_proxy_size` | `4096` | Fixed validation proxy size |
 | `--val_proxy_refresh` | `5000` | Proxy resample interval (steps) |
+| `--val_proxy_source` | `train` | Proxy distribution: `train` (default, paper behaviour) or `downstream` (task mixture — see below) |
+| `--val_proxy_tasks` | `hellaswag,arc_easy,arc_challenge,piqa,sciq` | Tasks used when `--val_proxy_source=downstream` |
 | `--selection_geometry_override` | `None` | Force scoring geometry (`sgd`/`adamw`/`sophia`/`lion`/`muon`) |
+
+### 4.1 Validation-proxy source (`train` vs `downstream`)
+
+The score $U(z,t)$ measures how much a candidate's update reduces loss on a
+validation proxy set. By default the proxy is drawn from the **training
+dataset's** val split (paper behaviour). You can instead draw it from a
+mixture of held-out multiple-choice benchmarks — *HellaSwag, ARC-Easy,
+ARC-Challenge, PIQA, SciQ* — turning $U(z,t)$ into a **task-aware**
+alignment signal: "which training sample most improves next-token prediction
+on the correct completions of downstream tasks".
+
+Switch modes with `--val_proxy_source`:
+
+```bash
+# Paper-default proxy (same distribution as training)
+python src/main.py ... --selection --val_proxy_source train
+
+# Downstream task-mixture proxy
+python src/main.py ... --selection --val_proxy_source downstream
+
+# Restrict to a subset of tasks
+python src/main.py ... --selection --val_proxy_source downstream \
+    --val_proxy_tasks hellaswag,arc_easy,arc_challenge
+```
+
+Implementation: [`src/selection/downstream_proxy.py`](src/selection/downstream_proxy.py)
+reuses the GPT-2 BPE tokenizers in
+[`src/data/benchmarks.py`](src/data/benchmarks.py). Each task's val split is
+tokenized once into a cached `.bin` file (~5–10 min on the very first run,
+rank 0 builds while other DDP ranks wait on a barrier); subsequent runs
+reuse the cache.
+
+**Caveats**
+
+- **Requires GPT-2 BPE (vocab ≥ 50257).** The downstream `.bin` files use
+  GPT-2 tokenization, so the model's vocabulary must cover it. Character-
+  level runs (e.g., Shakespeare-Char, vocab=95) are rejected with a clear
+  `ValueError` at proxy-build time.
+- **PIQA and SciQ may fail to load** depending on your `datasets` version.
+  As of `datasets ≥ 3.0`, script-based HF datasets (including `piqa` and
+  `sciq`) are rejected with
+  `RuntimeError: Dataset scripts are no longer supported`. The proxy handles
+  this gracefully: broken tasks are skipped with a warning, the doc budget
+  is rebalanced over the surviving tasks, and the run continues. If all
+  tasks fail, a clear error is raised. To suppress the warnings, pin
+  `--val_proxy_tasks hellaswag,arc_easy,arc_challenge` explicitly.
 
 ### 5. End-to-end experiment scripts
 
@@ -154,6 +203,23 @@ bash src/run_wikitext_exp.sh
 bash src/run_owt2_split.sh
 bash src/run_slimpajama_split.sh
 ```
+
+The WikiText and Shakespeare scripts also expose the downstream-proxy toggle
+via environment variables (passed through to `--val_proxy_source` /
+`--val_proxy_tasks`):
+
+```bash
+# WikiText with downstream-task proxy (results in wikitext_exp_v3_proxy_downstream/)
+PROXY_SOURCE=downstream bash src/run_wikitext_exp.sh 4
+
+# Restrict to reliable tasks (avoids PIQA/SciQ HF-script deprecation)
+PROXY_SOURCE=downstream PROXY_TASKS=hellaswag,arc_easy,arc_challenge \
+    bash src/run_wikitext_exp.sh 4
+```
+
+When `PROXY_SOURCE != train`, the scripts automatically suffix `RESULTS_DIR`
+and experiment names with `_proxy_<source>` so downstream-proxy runs don't
+collide with existing train-proxy results.
 
 Results are written under `src/logs/` and `src/exps/` (both gitignored).
 
