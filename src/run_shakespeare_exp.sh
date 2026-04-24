@@ -158,7 +158,7 @@ SEL_TEMP=0.1
 SEL_SKETCH=1024
 SEL_REDUNDANCY=1.0
 VAL_PROXY_SIZE=512          # Paper uses 4,096; Shakespeare val = 220K chars ≈ 860 docs at seq=256
-VAL_PROXY_REFRESH=100      # Refresh more often than paper's 5000 since training is short
+VAL_PROXY_REFRESH=50      # Refresh more often than paper's 5000 since training is short
 
 # Batch configs
 BATCH="--batch_size ${BATCH_SIZE} --sequence_length ${SEQ_LEN} --acc_steps ${ACC_STEPS}"

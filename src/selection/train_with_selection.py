@@ -222,13 +222,13 @@ def train_with_selection(
         outputs["loss"].backward()
         engine.stop_capture()
 
-        # Snapshot Ghost factors before gradients get modified
-        candidate_activations = {
-            k: v.clone() for k, v in engine._layer_activations.items()
-        }
-        candidate_backprops = {
-            k: v.clone() for k, v in engine._layer_backprops.items()
-        }
+        # Hand over Ghost factors from the engine. The hooks will re-populate
+        # fresh dicts on the next capture pass, so a clone here just doubles
+        # peak bf16 memory for no reason.
+        candidate_activations = engine._layer_activations
+        candidate_backprops = engine._layer_backprops
+        engine._layer_activations = {}
+        engine._layer_backprops = {}
 
         # Verify candidates captured (should equal actual_B_cand in dim 0)
         if len(candidate_activations) == 0:

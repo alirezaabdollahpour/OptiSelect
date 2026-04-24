@@ -58,6 +58,7 @@ source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate
 export PYTHONPATH="/mloscratch/homes/aabdolla/GhostSuite:${SRC_DIR}:$PYTHONPATH"
 export HF_HOME=/mloscratch/homes/aabdolla/.hf_cache
 export HF_DATASETS_CACHE=/mloscratch/homes/aabdolla/.hf_cache/datasets
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p "$RESULTS_DIR" logs
 

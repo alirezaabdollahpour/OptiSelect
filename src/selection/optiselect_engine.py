@@ -74,8 +74,13 @@ class OptiSelectEngine:
     # ------------------------------------------------------------------
 
     def _register_ghost_hooks(self):
+        # Skip vocabulary-sized readout layers: their per-sample backprops are
+        # O(B·seq·vocab), dominating peak memory, while the selection signal
+        # lives in transformer-body layers (Paper Section 4.3).
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
+                if "lm_head" in name or module.out_features > 32768:
+                    continue
                 self._target_layers[name] = module
                 fwd_hook = module.register_forward_hook(self._make_forward_hook(name))
                 bwd_hook = module.register_full_backward_hook(self._make_backward_hook(name))
