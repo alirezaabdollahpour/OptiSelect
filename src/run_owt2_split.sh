@@ -90,6 +90,9 @@ print(f'[OK] OpenWebText2 val:   {len(data2):,} tokens')
 "
 
 # ---- Scale-dependent parameters ----
+# Sophia bs convention: trainer sets bs := sophia_bs × seq_len, so sophia_bs
+# must equal the EFFECTIVE batch in examples (batch_size × acc_steps), matching
+# the original Liu et al. "bs = total tokens per opt step" convention.
 if [ "$SCALE" == "full" ]; then
     MODEL_ARGS="--model llama --n_embd 768 --n_head 12 --n_layer 12"
     BATCH="--batch_size 64 --sequence_length 512 --acc_steps 4"
@@ -100,7 +103,7 @@ if [ "$SCALE" == "full" ]; then
     SEL_WARMUP=380
     EVAL_INTERVAL=1000
     LOG_INTERVAL=100
-    SOPHIA_BS=32
+    SOPHIA_BS=256       # = 32 × 8 (effective batch in examples)
     DESCRIPTION="124M params, 5.0B tokens"
 else
     MODEL_ARGS="--model llama --n_embd 384 --n_head 6 --n_layer 6"
@@ -112,7 +115,7 @@ else
     SEL_WARMUP=240
     EVAL_INTERVAL=400
     LOG_INTERVAL=100
-    SOPHIA_BS=16
+    SOPHIA_BS=32        # = 16 × 2 (effective batch in examples)
     DESCRIPTION="25M params, 196M tokens"
 fi
 
@@ -159,6 +162,11 @@ run_experiment() {
     else
         ITERS=$SEL_ITERS; WARMUP=$SEL_WARMUP
     fi
+
+    # AdEMAMix's β₃/α warmup must equal the actual ITERS for the current
+    # mode (standard vs selection use different lengths), so we substitute
+    # the __ITERS__ sentinel here rather than at function-definition time.
+    OPT_EXTRA="${OPT_EXTRA//__ITERS__/$ITERS}"
 
     if [ -f "${RESULTS_DIR}/${EXP_NAME}/summary.json" ]; then
         echo "[SKIP] ${EXP_NAME}"
@@ -208,17 +216,31 @@ run_experiment() {
 
 
 # ======================================================================
-#  Optimizer definitions (Appendix B)
+#  Optimizer definitions (canonical recipes — Paper Appendix C)
+#
+#  Cross-script consistency notes (matched with run_wikitext_exp.sh and
+#  run_slimpajama_split.sh):
+#    - AdEMAMix: α=8.0, β₃=0.999 with warmup=ITERS at all scales (Pagliardini
+#      et al. canonical). The literal "__ITERS__" is substituted at runtime
+#      with the mode-specific ITERS in run_experiment.
+#    - Sophia: Liu et al. canonical (β=(0.965,0.99), ρ=0.04). lr=6e-4 at all
+#      scales here since both small (25M) and full (124M) sit within the
+#      paper's 125M neighborhood. sophia_bs = batch × acc_steps (set as
+#      SOPHIA_BS above) so trainer's bs = sophia_bs × seq_len matches the
+#      "total tokens per opt step" convention.
+#    - ADOPT: β₂=0.9999 (paper recipe — slow lagged-variance EMA).
+#    - Lion / Signum: lr=3e-4 = AdamW/3.3 (Chen et al. recommend AdamW/3
+#      to AdamW/10 for sign-based updates).
 # ======================================================================
 run_adamw()    { run_experiment "adamw"    "$1" "--opt adamw"    "--lr 1e-3 --beta1 0.9 --beta2 0.999"; }
-run_ademamix() { run_experiment "ademamix" "$1" "--opt ademamix" "--lr 1e-3 --beta1 0.9 --beta2 0.999 --adema_beta3 0.9999 --adema_alpha 0.8"; }
+run_ademamix() { run_experiment "ademamix" "$1" "--opt ademamix" "--lr 1e-3 --beta1 0.9 --beta2 0.999 --adema_beta3 0.999 --adema_alpha 8.0 --adema_beta3_warmup __ITERS__ --adema_alpha_warmup __ITERS__"; }
 run_dmuon()    { run_experiment "d-muon"   "$1" "--opt d-muon"   "--lr 1e-3 --beta1 0.9 --beta2 0.999 --momentum 0.95 --nesterov True --muon_ns_steps 5"; }
-run_mars()     { run_experiment "mars"     "$1" "--opt mars"     "--lr 1e-3 --mars_lr 3e-3 --beta1 0.9 --mars_beta1 0.95 --beta2 0.999 --mars_beta2 0.99"; }
-run_sophiag()  { run_experiment "sophiag"  "$1" "--opt sophiag"  "--lr 1e-3 --beta1 0.9 --beta2 0.999 --sophia_rho 0.04 --precondition_frequency 10 --sophia_bs ${SOPHIA_BS}" "$SOPHIA_BATCH"; }
+run_mars()     { run_experiment "mars"     "$1" "--opt mars"     "--lr 1e-3 --mars_lr 3e-3 --beta1 0.9 --mars_beta1 0.95 --beta2 0.999 --mars_beta2 0.99 --mars_vr_gamma 0.025"; }
+run_sophiag()  { run_experiment "sophiag"  "$1" "--opt sophiag"  "--lr 6e-4 --beta1 0.965 --beta2 0.99 --sophia_rho 0.04 --precondition_frequency 10 --sophia_bs ${SOPHIA_BS}" "$SOPHIA_BATCH"; }
 run_soap()     { run_experiment "soap"     "$1" "--opt soap"     "--lr 1e-3 --beta1 0.9 --beta2 0.95 --precondition_frequency 10"; }
 run_lion()     { run_experiment "lion"     "$1" "--opt lion"     "--lr 3e-4 --beta1 0.9 --beta2 0.99"; }
 run_signum()   { run_experiment "signum"   "$1" "--opt signum"   "--lr 3e-4 --momentum 0.9"; }
-run_adopt()    { run_experiment "adopt"    "$1" "--opt adopt"    "--lr 1e-3 --beta1 0.9 --beta2 0.999"; }
+run_adopt()    { run_experiment "adopt"    "$1" "--opt adopt"    "--lr 1e-3 --beta1 0.9 --beta2 0.9999"; }
 run_sgd()      { run_experiment "sgd"      "$1" "--opt sgd"      "--lr 3e-2 --momentum 0.9"; }
 
 

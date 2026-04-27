@@ -133,7 +133,11 @@ if [ "$SCALE" == "full" ]; then
     EVAL_INTERVAL=1000
     LOG_INTERVAL=100
     EVAL_BATCHES=64
-    SOPHIA_BS=32
+    # Sophia bs convention: trainer sets bs := sophia_bs × seq_len, so
+    # sophia_bs must equal the effective batch in EXAMPLES (batch × acc_steps),
+    # matching the original Liu et al. "bs = total tokens per opt step".
+    # SOPHIA_BATCH = 32 × 8 → SOPHIA_BS = 256.
+    SOPHIA_BS=256
     VAL_PROXY_SIZE=4096
     VAL_PROXY_REFRESH=5000
     DESCRIPTION="124M params, 5.0B tokens"
@@ -150,7 +154,8 @@ else
     EVAL_INTERVAL=400
     LOG_INTERVAL=100
     EVAL_BATCHES=32
-    SOPHIA_BS=16
+    # SOPHIA_BATCH = 16 × 2 → SOPHIA_BS = 32 (effective batch in examples).
+    SOPHIA_BS=32
     VAL_PROXY_SIZE=1024
     VAL_PROXY_REFRESH=3000
     DESCRIPTION="25M params, 196M tokens"
@@ -204,6 +209,12 @@ assert 'final_val_loss' in d and d['final_val_loss'] is not None
         ITERS=$SEL_ITERS; WARMUP=$SEL_WARMUP
     fi
 
+    # AdEMAMix's β₃/α warmup must equal the actual ITERS for the current
+    # mode (standard vs selection use different lengths). Substitute the
+    # __ITERS__ sentinel here rather than at function-definition time, so
+    # selection mode's shorter horizon doesn't leave α at 50% of its final.
+    OPT_EXTRA="${OPT_EXTRA//__ITERS__/$ITERS}"
+
     local SEL_FLAG=""
     if [ "$MODE" == "selection" ]; then
         SEL_FLAG="$SEL_ARGS"
@@ -249,11 +260,10 @@ assert 'final_val_loss' in d and d['final_val_loss'] is not None
         rm -rf "${RESULTS_DIR}/${EXP_NAME}"
         mv "$LOG_FILE" "${LOG_FILE}.oom-attempt1"
 
-        # For Sophia, update sophia_bs
+        # For Sophia, sophia_bs encodes the EFFECTIVE batch in examples
+        # (batch × acc_steps). Halving batch_size and doubling acc_steps
+        # preserves the effective batch, so sophia_bs must NOT change.
         local RETRY_EXTRA="$OPT_EXTRA"
-        if [ "$OPT_NAME" == "sophiag" ]; then
-            RETRY_EXTRA=$(echo "$OPT_EXTRA" | sed "s/--sophia_bs [0-9]*/--sophia_bs ${NEW_BS}/")
-        fi
 
         torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC} main.py \
             $MODEL_ARGS $DATA_ARGS $RETRY_BATCH \
@@ -274,10 +284,9 @@ assert 'final_val_loss' in d and d['final_val_loss'] is not None
                 return 1
             fi
             local RETRY_BATCH2="--batch_size ${NEW_BS2} --sequence_length 512 --acc_steps ${NEW_AS2}"
+            # See above: effective batch is preserved across halving, leave
+            # sophia_bs alone.
             local RETRY_EXTRA2="$OPT_EXTRA"
-            if [ "$OPT_NAME" == "sophiag" ]; then
-                RETRY_EXTRA2=$(echo "$OPT_EXTRA" | sed "s/--sophia_bs [0-9]*/--sophia_bs ${NEW_BS2}/")
-            fi
             rm -rf "${RESULTS_DIR}/${EXP_NAME}"
             mv "$LOG_FILE" "${LOG_FILE}.oom-attempt2"
 
@@ -324,10 +333,13 @@ run_adamw() {
 }
 
 run_ademamix() {
-    # Paper Eq. 8: operator identical to AdamW; slow momentum β₃=0.9999
-    # H1: largest selection synergy via Proposition 2
+    # Paper Eq. 8: operator identical to AdamW; slow momentum (β₃) stabilizes
+    # influence scores temporally (Proposition 2 — H1 selection-synergy test).
+    # Canonical Pagliardini et al. recipe applied at all scales for cross-scale
+    # comparability: α=8.0, β₃=0.999, warmup=ITERS (substituted at runtime so
+    # selection mode's SEL_ITERS gets its own warmup, not STD_ITERS).
     run_experiment "ademamix" "$1" "--opt ademamix" \
-        "--lr 1e-3 --beta1 0.9 --beta2 0.999 --adema_beta3 0.9999 --adema_alpha 0.8"
+        "--lr 1e-3 --beta1 0.9 --beta2 0.999 --adema_beta3 0.999 --adema_alpha 8.0 --adema_beta3_warmup __ITERS__ --adema_alpha_warmup __ITERS__"
 }
 
 run_dmuon() {
@@ -345,8 +357,17 @@ run_mars() {
 run_sophiag() {
     # Paper Eq. 11: O_t^Sophia(x) = clip(x / max(ρh_t, ε), 1), linearized
     # H3 / Proposition 1: Hessian diagonal = curvature component of π*
+    #
+    # Hyperparameters follow the Liu et al. canonical recipe (β=(0.965,0.99),
+    # ρ=0.04, lr=6e-4 for GPT2-small). Three subtle pitfalls — all fixed:
+    #   (i)  β₂=0.99 (not 0.999): with k=10 precond_freq, β₂=0.999 leaves the
+    #        Hessian EMA cold for ~6.9k steps and Sophia degenerates to sign-SGD.
+    #   (ii) lr=6e-4 (not 1e-3): in the clamp-saturated regime the update is
+    #        -lr·sign(m), so a too-hot lr blows up before curvature engages.
+    #   (iii) sophia_bs = batch × acc_steps (set as SOPHIA_BS above), because
+    #         the trainer sets bs := sophia_bs × seq_len.
     run_experiment "sophiag" "$1" "--opt sophiag" \
-        "--lr 1e-3 --beta1 0.9 --beta2 0.999 --sophia_rho 0.04 --precondition_frequency 10 --sophia_bs ${SOPHIA_BS}" \
+        "--lr 6e-4 --beta1 0.965 --beta2 0.99 --sophia_rho 0.04 --precondition_frequency 10 --sophia_bs ${SOPHIA_BS}" \
         "$SOPHIA_BATCH"
 }
 
@@ -373,9 +394,12 @@ run_signum() {
 }
 
 run_adopt() {
-    # Paper Section 4.3.1: lagged variance (t-1)
+    # Paper Section 4.3.1: lagged variance (t-1).
+    # ADOPT paper recipe uses β₂=0.9999 (slow variance EMA); β₂=0.999 is 10×
+    # faster and weakens the lagged-variance characterization that the paper's
+    # Section 4.3.1 operator analysis depends on.
     run_experiment "adopt" "$1" "--opt adopt" \
-        "--lr 1e-3 --beta1 0.9 --beta2 0.999"
+        "--lr 1e-3 --beta1 0.9 --beta2 0.9999"
 }
 
 run_sgd() {
