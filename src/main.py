@@ -78,7 +78,11 @@ def main(args, parser):
         wandb.define_metric("iter")
         wandb.define_metric("train/*", step_metric="iter")
         wandb.define_metric("val/*", step_metric="iter")
+        wandb.define_metric("selection/*", step_metric="iter")
+        wandb.define_metric("flops/*", step_metric="iter")
         wandb.define_metric("lr", step_metric="iter")
+        wandb.define_metric("tokens", step_metric="iter")
+        wandb.define_metric("processed_tokens", step_metric="iter")
 
     print(f"Starting Experiment: {exp_name}")
     print(f"Experiment Directory: {exp_dir}")

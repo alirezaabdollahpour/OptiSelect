@@ -1,74 +1,48 @@
 import os
-
-import numpy as np
-import tiktoken
-from datasets import load_dataset
-from tqdm import tqdm
-
-tknzr = tiktoken.get_encoding("gpt2")
+import subprocess
+import sys
+from pathlib import Path
 
 
 def get_fineweb_data(datasets_dir, num_proc=40):
-    """To change the cache dir, run `export HF_HOME=/path/to/cache/` before running the code."""
-    FWEB_DATA_PATH = os.path.join(datasets_dir, "fineweb-100BT/")
-    if not os.path.exists(os.path.join(FWEB_DATA_PATH, "train.bin")):
-        os.makedirs(FWEB_DATA_PATH, exist_ok=True)
+    """Return paths to the tokenized FineWeb100B GPT-2 memmaps.
 
-        dataset = load_dataset(
-            "HuggingFaceFW/fineweb",
-            name="sample-100BT",
-            split="train",
-            streaming=False,
-            verification_mode="no_checks",
+    If the files are missing, prepare them from kjj0/fineweb100B-gpt2, which
+    already contains GPT-2 uint16 token chunks. This avoids the slow raw
+    FineWeb download + local tokenization path.
+    """
+    del num_proc
+
+    fweb_data_path = Path(datasets_dir) / "fineweb-100BT"
+    train_path = fweb_data_path / "train.bin"
+    val_path = fweb_data_path / "val.bin"
+
+    if not (train_path.exists() and val_path.exists()):
+        repo_root = Path(__file__).resolve().parents[2]
+        prepare_script = repo_root / "scripts" / "prepare_fineweb_100bt.py"
+        if not prepare_script.exists():
+            raise FileNotFoundError(
+                f"Missing FineWeb files in {fweb_data_path} and could not find "
+                f"the preparation script at {prepare_script}"
+            )
+
+        subprocess.check_call(
+            [
+                sys.executable,
+                str(prepare_script),
+                "--datasets_dir",
+                os.fspath(Path(datasets_dir)),
+            ]
         )
 
-        split_dataset = dataset.train_test_split(
-            test_size=0.0001, seed=2357, shuffle=True
+    if not train_path.exists() or not val_path.exists():
+        raise FileNotFoundError(
+            f"FineWeb preparation did not produce both {train_path} and {val_path}"
         )
-        split_dataset["val"] = split_dataset.pop("test")
-
-        def process(example):
-            ids = tknzr.encode_ordinary(
-                example["text"]
-            )  # encode_ordinary ignores any special tokens
-            ids.append(
-                tknzr.eot_token
-            )  # add the end of text token, e.g. 50256 for gpt2 bpe
-            # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
-            out = {"ids": ids, "len": len(ids)}
-            return out
-
-        # tokenize the dataset
-        tokenized = split_dataset.map(
-            process,
-            remove_columns=["text"],
-            desc="tokenizing the splits",
-            num_proc=num_proc,
-        )
-
-        # concatenate all the ids in each dataset into one large file we can use for training
-        for split, dset in tokenized.items():
-            arr_len = np.sum(dset["len"])
-            filename = os.path.join(FWEB_DATA_PATH, f"{split}.bin")
-            dtype = np.uint16  # (can do since enc.max_token_value == 50256 is < 2**16)
-            arr = np.memmap(filename, dtype=dtype, mode="w+", shape=(arr_len,))
-            total_batches = min(1024, len(dset))
-
-            idx = 0
-            for batch_idx in tqdm(range(total_batches), desc=f"writing {filename}"):
-                # Batch together samples for faster write
-                batch = dset.shard(
-                    num_shards=total_batches, index=batch_idx, contiguous=True
-                ).with_format("numpy")
-                arr_batch = np.concatenate(batch["ids"])
-                # Write into mmap
-                arr[idx : idx + len(arr_batch)] = arr_batch
-                idx += len(arr_batch)
-            arr.flush()
 
     return {
-        "train": os.path.join(FWEB_DATA_PATH, "train.bin"),
-        "val": os.path.join(FWEB_DATA_PATH, "val.bin"),
+        "train": os.fspath(train_path),
+        "val": os.fspath(val_path),
     }
 
 

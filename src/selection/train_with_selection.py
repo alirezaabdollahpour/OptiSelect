@@ -31,6 +31,7 @@ from typing import Dict, Tuple, List, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 
 from data.utils import get_dataset, DataReader
 from optim.base import get_batch
@@ -102,6 +103,13 @@ def train_with_selection(
         if t.strip()
     ]
     candidate_chunk_size = int(getattr(cfg, "candidate_chunk_size", 0))
+    world_size = int(getattr(cfg, "world_size", 1))
+    acc_steps = max(1, int(getattr(cfg, "acc_steps", 1)))
+    param_count = sum(p.numel() for p in model.parameters())
+    is_master = (
+        distributed_backend is None
+        or distributed_backend.is_master_process()
+    )
 
     B = cfg.batch_size
     B_cand = B * candidate_multiplier
@@ -409,13 +417,35 @@ def train_with_selection(
             sel_summary = engine.get_selection_summary()
             current_lr = scheduler.get_last_lr()[0] if scheduler else cfg.lr
             entropy = sel_summary.get("mean_entropy", float("nan"))
+            update_tokens = (
+                curr_iter * world_size * B * acc_steps * cfg.sequence_length
+            )
+            processed_tokens = update_tokens * (1 + candidate_multiplier)
+            train_loss_value = float(loss.item())
             print(
                 f"Train: Iter={curr_iter} "
-                f"train_loss={loss.item():.4f} "
+                f"train_loss={train_loss_value:.4f} "
                 f"iter_dt={step_times[-1]:.2f}s "
                 f"lr={current_lr:.2e} "
                 f"sel_entropy={entropy:.2f}"
             )
+            if getattr(cfg, "wandb", False) and is_master:
+                wandb.log({
+                    "iter": curr_iter,
+                    "tokens": update_tokens,
+                    "processed_tokens": processed_tokens,
+                    "train/loss": train_loss_value,
+                    "train/perplexity": math.exp(min(train_loss_value, 20.0)),
+                    "lr": current_lr,
+                    "iter_dt": step_times[-1],
+                    "selection/entropy": entropy,
+                    "selection/candidate_multiplier": candidate_multiplier,
+                    "selection/temperature": temperature,
+                    "selection/redundancy_weight": redundancy_weight,
+                    "selection/val_proxy_size": val_proxy_size,
+                    "selection/val_proxy_refresh": val_proxy_refresh,
+                    "flops/estimated_training": 6 * param_count * processed_tokens,
+                })
 
         # ==============================================================
         #  Evaluation
@@ -438,6 +468,24 @@ def train_with_selection(
                 f"val_pp={val_pp:.3f} "
                 f"val_acc={val_acc:.6f}"
             )
+            update_tokens = (
+                curr_iter * world_size * B * acc_steps * cfg.sequence_length
+            )
+            processed_tokens = update_tokens * (1 + candidate_multiplier)
+            if getattr(cfg, "wandb", False) and is_master:
+                wandb.log({
+                    "iter": curr_iter,
+                    "tokens": update_tokens,
+                    "processed_tokens": processed_tokens,
+                    "val/loss": float(val_loss),
+                    "val/perplexity": float(val_pp),
+                    "val/acc": float(val_acc),
+                    "selection/entropy": (
+                        engine.selection_stats["entropy"][-1]
+                        if engine.selection_stats["entropy"] else float("nan")
+                    ),
+                    "flops/estimated_training": 6 * param_count * processed_tokens,
+                })
 
             history.append({
                 "iter": curr_iter,
@@ -499,6 +547,24 @@ def train_with_selection(
         f">Eval: Iter={cfg.iterations} "
         f"val_loss={val_loss:.4f} val_pp={val_pp:.3f} val_acc={val_acc:.6f}"
     )
+    update_tokens = (
+        cfg.iterations * world_size * B * acc_steps * cfg.sequence_length
+    )
+    processed_tokens = update_tokens * (1 + candidate_multiplier)
+    if getattr(cfg, "wandb", False) and is_master:
+        wandb.log({
+            "iter": cfg.iterations,
+            "tokens": update_tokens,
+            "processed_tokens": processed_tokens,
+            "final-val/loss": float(val_loss),
+            "final-val/perplexity": float(val_pp),
+            "final-val/acc": float(val_acc),
+            "selection/entropy": (
+                engine.selection_stats["entropy"][-1]
+                if engine.selection_stats["entropy"] else float("nan")
+            ),
+            "flops/estimated_training": 6 * param_count * processed_tokens,
+        })
 
     history.append({
         "iter": cfg.iterations,

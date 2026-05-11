@@ -272,6 +272,12 @@ COMMON_ARGS="--iterations ${ITERS} --warmup_steps ${WARMUP_STEPS} --scheduler co
 COMMON_ARGS="${COMMON_ARGS} --grad_clip ${GRAD_CLIP} --weight_decay ${WEIGHT_DECAY}"
 COMMON_ARGS="${COMMON_ARGS} --dropout 0.0 --dtype bfloat16 --device cuda:0"
 COMMON_ARGS="${COMMON_ARGS} --distributed_backend nccl"
+# Save the final-iteration checkpoint for the *standard* trainer (the
+# selection trainer always writes best.pt/final.pt). With latest_ckpt_interval
+# == ITERS the standard trainer's "or curr_iter == cfg.iterations" branch
+# saves to ckpts/latest/main.pt at the very end and nowhere else, so the
+# extra disk cost is one checkpoint per run.
+COMMON_ARGS="${COMMON_ARGS} --latest_ckpt_interval ${ITERS}"
 
 EVAL_ARGS="--eval_interval ${EVAL_INTERVAL} --log_interval ${LOG_INTERVAL}"
 EVAL_ARGS="${EVAL_ARGS} --eval_batches ${EVAL_BATCHES}"

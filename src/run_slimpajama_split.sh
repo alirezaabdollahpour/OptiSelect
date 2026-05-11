@@ -78,9 +78,22 @@ SCALE=${2:-full}
 SEED=${3:-0}
 NPROC=${4:-4}   # GPUs per run (DDP world size)
 
+# ---- Validation-proxy source for OptiSelect ----
+# PROXY_SOURCE=train (default, Paper Appendix C) or downstream (mixture
+# of HellaSwag/ARC-E/ARC-C/PIQA/SciQ). Downstream requires GPT-2 BPE.
+PROXY_SOURCE=${PROXY_SOURCE:-train}
+PROXY_TASKS=${PROXY_TASKS:-hellaswag,arc_easy,arc_challenge,piqa,sciq}
+
 SRC_DIR="/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src"
 DATASETS_DIR="/mloscratch/homes/aabdolla/datasets"
-RESULTS_DIR="/mloscratch/homes/aabdolla/results/slimpajama_exp_${SCALE}"
+
+# Backward-compat: train-proxy keeps the original results dir; downstream
+# (or any non-train proxy) gets its own dir so runs don't collide.
+if [ "$PROXY_SOURCE" = "train" ]; then
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/slimpajama_exp_${SCALE}"
+else
+    RESULTS_DIR="/mloscratch/homes/aabdolla/results/slimpajama_exp_${SCALE}_proxy_${PROXY_SOURCE}"
+fi
 
 cd "$SRC_DIR"
 source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate
@@ -90,7 +103,7 @@ export HF_DATASETS_CACHE=/mloscratch/homes/aabdolla/.hf_cache/datasets
 
 # Memory safety
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export SCALE SEED RESULTS_DIR
+export SCALE SEED RESULTS_DIR PROXY_SOURCE
 
 mkdir -p "$RESULTS_DIR" logs
 
@@ -173,6 +186,8 @@ SEL_ARGS="${SEL_ARGS} --selection_temperature 0.1 --selection_sketch_dim 1024"
 SEL_ARGS="${SEL_ARGS} --selection_redundancy_weight 1.0"
 SEL_ARGS="${SEL_ARGS} --val_proxy_size ${VAL_PROXY_SIZE}"
 SEL_ARGS="${SEL_ARGS} --val_proxy_refresh ${VAL_PROXY_REFRESH}"
+SEL_ARGS="${SEL_ARGS} --val_proxy_source ${PROXY_SOURCE}"
+SEL_ARGS="${SEL_ARGS} --val_proxy_tasks ${PROXY_TASKS}"
 
 
 # ======================================================================
@@ -185,7 +200,12 @@ run_experiment() {
     local OPT_EXTRA=$4
     local BATCH_OVR=${5:-$BATCH}
 
-    local EXP_NAME="${MODE}_slimpajama_${SCALE}_${OPT_NAME}_seed${SEED}"
+    local EXP_NAME
+    if [ "$PROXY_SOURCE" = "train" ]; then
+        EXP_NAME="${MODE}_slimpajama_${SCALE}_${OPT_NAME}_seed${SEED}"
+    else
+        EXP_NAME="${MODE}_slimpajama_${SCALE}_proxy-${PROXY_SOURCE}_${OPT_NAME}_seed${SEED}"
+    fi
     local LOG_FILE="logs/${EXP_NAME}.log"
 
     # Skip only if summary has valid final_val_loss
@@ -317,6 +337,8 @@ echo ""
 echo "================================================================"
 echo "  OptiSelect SlimPajama Split ${SPLIT} | ${SCALE}"
 echo "  ${DESCRIPTION} | Seed: ${SEED} | DDP GPUs: ${NPROC}"
+echo "  Proxy source: ${PROXY_SOURCE}$([ "$PROXY_SOURCE" != "train" ] && echo " [${PROXY_TASKS}]")"
+echo "  Results dir:  ${RESULTS_DIR}"
 echo "  Alloc: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 echo "  Started: $(date)"
 echo "================================================================"
@@ -463,9 +485,12 @@ import os, json
 
 SCALE = os.environ.get("SCALE", "full")
 SEED = int(os.environ.get("SEED", "0"))
+PROXY_SOURCE = os.environ.get("PROXY_SOURCE", "train")
 RESULTS_DIR = os.environ.get("RESULTS_DIR",
     f"/mloscratch/homes/aabdolla/results/slimpajama_exp_{SCALE}")
 LOG_DIR = "logs"
+
+PROXY_TAG = "" if PROXY_SOURCE == "train" else f"proxy-{PROXY_SOURCE}_"
 
 optimizers = ["adamw", "ademamix", "d-muon", "mars", "sophiag", "soap",
               "lion", "signum", "adopt", "sgd"]
@@ -484,7 +509,7 @@ for opt in optimizers:
     results[opt] = {}
     for mode in modes:
         p = os.path.join(RESULTS_DIR,
-                         f"{mode}_slimpajama_{SCALE}_{opt}_seed{SEED}",
+                         f"{mode}_slimpajama_{SCALE}_{PROXY_TAG}{opt}_seed{SEED}",
                          "summary.json")
         r = {"val_loss": None, "val_pp": None, "val_acc": None, "entropy": None}
         if os.path.exists(p):
@@ -576,10 +601,14 @@ else:
     print(r"\end{tabular}")
     print(r"\end{table}")
 
-    out = os.path.join(LOG_DIR, f"slimpajama_{SCALE}_results_seed{SEED}.json")
+    proxy_suffix = "" if PROXY_SOURCE == "train" else f"_proxy-{PROXY_SOURCE}"
+    out = os.path.join(LOG_DIR, f"slimpajama_{SCALE}_results_seed{SEED}{proxy_suffix}.json")
     with open(out, "w") as f:
         json.dump({
-            "metadata": {"scale": SCALE, "seed": SEED, "description": desc, "dataset": "slimpajama"},
+            "metadata": {
+                "scale": SCALE, "seed": SEED, "description": desc,
+                "dataset": "slimpajama", "proxy_source": PROXY_SOURCE,
+            },
             "results": results,
         }, f, indent=2)
     print(f"\nSaved: {out}")

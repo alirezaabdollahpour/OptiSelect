@@ -103,6 +103,7 @@ def train(
     train_reader.set_step(substep)
     stats = {"train_loss": [], "val_loss": [], "val_pp": [], "val_acc": []}
     grad_norms = []
+    param_count = sum(p.numel() for p in model.parameters())
     model.train()
 
     while curr_iter <= cfg.iterations:
@@ -267,11 +268,13 @@ def train(
             if cfg.wandb:
                 wandb_logs = {
                     "tokens": tokens,
+                    "processed_tokens": tokens,
                     "iter": curr_iter,
                     "train/loss": train_loss,
                     "train/perplexity": 2.71828**train_loss,
                     "lr": current_lrs[0],
                     "iter_dt": dt,
+                    "flops/estimated_training": 6 * param_count * tokens,
                     "max_grad_norm": max(grad_norms).item() if grad_norms else 0,
                     "mean_grad_norm": (
                         torch.tensor(grad_norms).mean().item() if grad_norms else 0
@@ -341,22 +344,27 @@ def eval_and_log(
     )
 
     if cfg.wandb:
+        param_count = sum(p.numel() for p in model.parameters())
         if curr_iter == cfg.iterations or full_eval:
             logs = {
                 "tokens": tokens,
+                "processed_tokens": tokens,
                 "iter": curr_iter,
                 "final-val/loss": val_loss,
                 "final-val/perplexity": val_perplexity,
                 "final-val/acc": val_acc,
+                "flops/estimated_training": 6 * param_count * tokens,
                 **val_aux_losses,
             }
         else:
             logs = {
                 "tokens": tokens,
+                "processed_tokens": tokens,
                 "iter": curr_iter,
                 "val/loss": val_loss,
                 "val/perplexity": val_perplexity,
                 "val/acc": val_acc,
+                "flops/estimated_training": 6 * param_count * tokens,
                 **val_aux_losses,
             }
         if cfg.moe and cfg.plot_router_logits:

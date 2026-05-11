@@ -7,5 +7,6 @@ tqdm
 transformers
 wandb
 datasets
+huggingface_hub[hf_transfer]
 zstandard
 numpy==1.22.4
