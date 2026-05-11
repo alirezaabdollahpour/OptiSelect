@@ -123,3 +123,6 @@ Plots/
 selection_stats.json
 summary.json
 shakespeare_results_*.json
+*.pdf 
+*.png
+*.jpg
