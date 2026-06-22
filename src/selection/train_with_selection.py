@@ -89,6 +89,9 @@ def train_with_selection(
     candidate_multiplier = getattr(cfg, "candidate_multiplier", 2)
     temperature = getattr(cfg, "selection_temperature", 0.1)
     sketch_dim = getattr(cfg, "selection_sketch_dim", 1024)
+    use_countsketch = bool(getattr(cfg, "selection_use_countsketch", True))
+    countsketch_row_block = int(getattr(cfg, "selection_countsketch_row_block", 32))
+    countsketch_token_block = int(getattr(cfg, "selection_countsketch_token_block", 128))
     redundancy_weight = getattr(cfg, "selection_redundancy_weight", 1.0)
     val_proxy_size = getattr(cfg, "val_proxy_size", 4096)
     val_proxy_refresh = getattr(cfg, "val_proxy_refresh", 5000)
@@ -191,7 +194,9 @@ def train_with_selection(
         sketch_dim=sketch_dim,
         temperature=temperature,
         redundancy_weight=redundancy_weight,
-        use_countsketch=False,
+        use_countsketch=use_countsketch,
+        countsketch_row_block=countsketch_row_block,
+        countsketch_token_block=countsketch_token_block,
     )
 
     engine = OptiSelectEngine(
@@ -216,6 +221,8 @@ def train_with_selection(
     print(f"  Optimizer:            {cfg.opt}")
     print(f"  Candidate multiplier: {candidate_multiplier} (B̃={B_cand}, B={B_select})")
     print(f"  Temperature τ:        {temperature}")
+    print(f"  CountSketch:          {use_countsketch} (m={sketch_dim})")
+    print(f"  CountSketch blocks:   rows={countsketch_row_block}, tokens={countsketch_token_block}")
     print(f"  Redundancy weight:    {redundancy_weight}")
     print(f"  Val proxy size:       {val_proxy_size} (actual: {actual_proxy_docs})")
     print(f"  Val proxy refresh:    every {val_proxy_refresh} steps")
@@ -298,6 +305,7 @@ def train_with_selection(
         engine.start_capture()
         chunked_a: Dict[str, List[torch.Tensor]] = {}
         chunked_b: Dict[str, List[torch.Tensor]] = {}
+        chunked_sketches: Dict[str, List[torch.Tensor]] = {}
 
         # Per-chunk loss rescale so per-sample gradients match the
         # un-chunked mean-over-B̃ case. Without this, reduction='mean'
@@ -318,10 +326,18 @@ def train_with_selection(
                 out = model(cx, targets=cy)
             (out["loss"] * loss_scale).backward()
 
-            for name, tensor in engine._layer_activations.items():
-                chunked_a.setdefault(name, []).append(tensor)
-            for name, tensor in engine._layer_backprops.items():
-                chunked_b.setdefault(name, []).append(tensor)
+            if engine.config.use_countsketch:
+                sketches = engine.build_candidate_sketches(
+                    engine._layer_activations,
+                    engine._layer_backprops,
+                )
+                for name, sketch in sketches.items():
+                    chunked_sketches.setdefault(name, []).append(sketch.detach())
+            else:
+                for name, tensor in engine._layer_activations.items():
+                    chunked_a.setdefault(name, []).append(tensor.detach())
+                for name, tensor in engine._layer_backprops.items():
+                    chunked_b.setdefault(name, []).append(tensor.detach())
 
             # Release the local forward graph before the next chunk
             del out
@@ -330,25 +346,39 @@ def train_with_selection(
         engine._layer_activations = {}
         engine._layer_backprops = {}
 
-        candidate_activations = {
-            name: torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
-            for name, parts in chunked_a.items()
-        }
-        candidate_backprops = {
-            name: torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
-            for name, parts in chunked_b.items()
-        }
-        del chunked_a, chunked_b
+        if engine.config.use_countsketch:
+            engine._last_candidate_sketches = {
+                name: torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+                for name, parts in chunked_sketches.items()
+            }
+            candidate_activations = {}
+            candidate_backprops = {}
+        else:
+            candidate_activations = {
+                name: torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+                for name, parts in chunked_a.items()
+            }
+            candidate_backprops = {
+                name: torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+                for name, parts in chunked_b.items()
+            }
+        del chunked_a, chunked_b, chunked_sketches
 
         # Verify candidates captured (should equal actual_B_cand in dim 0)
-        if len(candidate_activations) == 0:
+        if engine.config.use_countsketch:
+            if not engine._last_candidate_sketches:
+                print(f"[ERROR] Iter {curr_iter}: no CountSketch factors captured, skipping")
+                continue
+            any_tensor = next(iter(engine._last_candidate_sketches.values()))
+        elif len(candidate_activations) == 0:
             print(f"[ERROR] Iter {curr_iter}: no Ghost factors captured, skipping")
             continue
-        any_key = next(iter(candidate_activations))
-        if candidate_activations[any_key].size(0) != actual_B_cand:
+        else:
+            any_tensor = candidate_activations[next(iter(candidate_activations))]
+        if any_tensor.size(0) != actual_B_cand:
             print(
                 f"[WARN] Iter {curr_iter}: Ghost factor size mismatch "
-                f"({candidate_activations[any_key].size(0)} vs {actual_B_cand})"
+                f"({any_tensor.size(0)} vs {actual_B_cand})"
             )
 
         # Paper Remark 4: MARS raw-gradient variance update

@@ -30,7 +30,9 @@ class InfluenceConfig:
     sketch_dim: int = 1024
     temperature: float = 0.1
     redundancy_weight: float = 1.0  # λ_r from Paper Eq. 4
-    use_countsketch: bool = False   # Disabled by default (exact at 124M scale)
+    use_countsketch: bool = False
+    countsketch_row_block: int = 32
+    countsketch_token_block: int = 128
 
 
 class CountSketch:
@@ -58,6 +60,156 @@ class CountSketch:
         result = torch.zeros(*x.shape[:-1], self.m, device=x.device, dtype=x.dtype)
         result.scatter_add_(-1, self.hash_indices.expand_as(signed), signed)
         return result
+
+
+class OuterProductCountSketch:
+    """
+    CountSketch map for Ghost-factored linear-layer gradients.
+
+    A Linear layer's per-sample gradient can be represented from Ghost factors
+    as b(z) ⊗ a(z).  This class sketches that outer product with a structured
+    CountSketch hash h(o, i) = h_out(o) + h_in(i) mod m and sign
+    s(o, i) = s_out(o) * s_in(i).
+
+    When no coordinatewise optimizer preconditioner is present, the sketch is
+    computed by the TensorSketch identity:
+
+        CS(b ⊗ a) = CS_out(b) (*) CS_in(a)
+
+    where (*) is circular convolution.  This avoids the O(d_out * d_in)
+    scatter over outer-product coordinates.  Optional dense diagonal
+    preconditioner weights break that separability, so those cases fall back to
+    the streaming direct sketch without materializing the full gradient.
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        d_out: int,
+        m: int,
+        seed: int = 42,
+        row_block: int = 32,
+    ):
+        gen = torch.Generator()
+        gen.manual_seed(int(seed))
+        self.d_in = int(d_in)
+        self.d_out = int(d_out)
+        self.m = int(m)
+        self.row_block = max(1, int(row_block))
+        self.h_in = torch.randint(0, self.m, (self.d_in,), generator=gen)
+        self.h_out = torch.randint(0, self.m, (self.d_out,), generator=gen)
+        self.s_in = torch.randint(0, 2, (self.d_in,), generator=gen).float() * 2 - 1
+        self.s_out = torch.randint(0, 2, (self.d_out,), generator=gen).float() * 2 - 1
+
+    def to(self, device):
+        self.h_in = self.h_in.to(device)
+        self.h_out = self.h_out.to(device)
+        self.s_in = self.s_in.to(device)
+        self.s_out = self.s_out.to(device)
+        return self
+
+    def _countsketch_vectors(
+        self,
+        x: torch.Tensor,
+        hash_indices: torch.Tensor,
+        signs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sketch a batch of vectors with this layer's 1D CountSketch map."""
+        out = torch.zeros(x.size(0), self.m, device=x.device, dtype=torch.float32)
+        signed = x * signs.unsqueeze(0)
+        buckets = hash_indices.unsqueeze(0).expand(x.size(0), -1)
+        out.scatter_add_(1, buckets, signed)
+        return out
+
+    def _sketch_outer_tensorsketch(
+        self,
+        activations: torch.Tensor,
+        backprops: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Fast unweighted outer-product sketch via circular convolution.
+
+        The hash/sign convention matches _sketch_outer_direct exactly:
+        bucket(o, i) = (h_out[o] + h_in[i]) mod m and
+        sign(o, i) = s_out[o] * s_in[i].
+        """
+        sketch_a = self._countsketch_vectors(activations, self.h_in, self.s_in)
+        sketch_b = self._countsketch_vectors(backprops, self.h_out, self.s_out)
+
+        fft_a = torch.fft.rfft(sketch_a, n=self.m, dim=-1)
+        fft_b = torch.fft.rfft(sketch_b, n=self.m, dim=-1)
+        return torch.fft.irfft(fft_b * fft_a, n=self.m, dim=-1).to(torch.float32)
+
+    def _sketch_outer_direct(
+        self,
+        activations: torch.Tensor,
+        backprops: torch.Tensor,
+        preconditioner: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Streaming direct sketch used for non-separable weighted products."""
+        B = activations.size(0)
+        out = torch.zeros(B, self.m, device=activations.device, dtype=torch.float32)
+        signed_a = activations * self.s_in.unsqueeze(0)
+
+        for row_start in range(0, self.d_out, self.row_block):
+            row_end = min(row_start + self.row_block, self.d_out)
+            h_rows = self.h_out[row_start:row_end]
+            s_rows = self.s_out[row_start:row_end]
+            buckets = (h_rows[:, None] + self.h_in[None, :]).remainder(self.m)
+            values = (
+                backprops[:, row_start:row_end] * s_rows.unsqueeze(0)
+            ).unsqueeze(-1) * signed_a.unsqueeze(1)
+            if preconditioner is not None:
+                values = values * preconditioner[row_start:row_end].unsqueeze(0)
+
+            flat_buckets = buckets.reshape(1, -1).expand(B, -1)
+            out.scatter_add_(1, flat_buckets, values.reshape(B, -1))
+
+        return out
+
+    def sketch_outer(
+        self,
+        activations: torch.Tensor,
+        backprops: torch.Tensor,
+        preconditioner: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Sketch preconditioned outer products.
+
+        Args:
+            activations:    (B, d_in) Ghost activation factors a(z)
+            backprops:      (B, d_out) Ghost backprop factors b(z)
+            preconditioner: optional (d_out, d_in) diagonal optimizer
+                            weights applied coordinatewise to b ⊗ a
+
+        Returns:
+            (B, m) CountSketch features.
+        """
+        if activations.dim() != 2 or backprops.dim() != 2:
+            raise ValueError("OuterProductCountSketch expects 2D Ghost factors")
+        if activations.size(1) != self.d_in or backprops.size(1) != self.d_out:
+            raise ValueError(
+                "Ghost factor dimensions do not match sketch map: "
+                f"a={tuple(activations.shape)}, b={tuple(backprops.shape)}, "
+                f"expected (*,{self.d_in}) and (*,{self.d_out})"
+            )
+
+        a = activations.to(torch.float32)
+        b = backprops.to(torch.float32)
+        device = a.device
+        self.to(device)
+
+        if preconditioner is not None:
+            preconditioner = preconditioner.to(device=device, dtype=torch.float32)
+            if tuple(preconditioner.shape) != (self.d_out, self.d_in):
+                raise ValueError(
+                    f"preconditioner shape {tuple(preconditioner.shape)} "
+                    f"does not match {(self.d_out, self.d_in)}"
+                )
+
+        if preconditioner is None:
+            return self._sketch_outer_tensorsketch(a, b)
+        return self._sketch_outer_direct(a, b, preconditioner)
 
 
 # =============================================================================
@@ -212,11 +364,19 @@ def compute_muon_scores(
 
     cand_a = activations.to(torch.float32)
     cand_b = backprops.to(torch.float32)
+    if cand_a.dim() == 2:
+        cand_a = cand_a.unsqueeze(1)
+    else:
+        cand_a = cand_a.reshape(cand_a.size(0), -1, cand_a.size(-1))
+    if cand_b.dim() == 2:
+        cand_b = cand_b.unsqueeze(1)
+    else:
+        cand_b = cand_b.reshape(cand_b.size(0), -1, cand_b.size(-1))
 
-    a_dot = torch.einsum('bsi,i->bs', cand_a, P_aV).sum(dim=1)
-    b_dot = torch.einsum('bso,o->bs', cand_b, val_b).sum(dim=1)
+    a_dot = torch.einsum('bsi,i->bs', cand_a, P_aV)
+    b_dot = torch.einsum('bso,o->bs', cand_b, val_b)
 
-    return a_dot * b_dot
+    return (a_dot * b_dot).sum(dim=1)
 
 
 def compute_soap_scores(
@@ -400,6 +560,12 @@ def extract_optimizer_preconditioner(
             # m_t plays the role of m_{t-1}, so current state is correct.
             m = state["exp_avg"]
             return {"type": "lion", "sign_ut": torch.sign(m)}
+        if "momentum_buffer" in state:
+            # Signum/SignSGD stores its frozen momentum state under this key.
+            # Plain signSGD with momentum=0 has no frozen sign state, so it
+            # correctly falls back to raw-gradient scoring below.
+            m = state["momentum_buffer"]
+            return {"type": "lion", "sign_ut": torch.sign(m)}
         return {"type": "sgd"}
 
     # ---- Sophia (curvature-aware, Paper Eq. 11) ----
@@ -419,8 +585,9 @@ def extract_optimizer_preconditioner(
 
     # ---- Muon (matrix, Paper Eq. 15) ----
     elif opt_name in ("muon", "d-muon"):
-        if "momentum_buffer" in state:
-            M = state["momentum_buffer"]
+        momentum = state.get("momentum_buffer", state.get("muon_buffer", None))
+        if momentum is not None:
+            M = momentum
             if M.dim() == 2:
                 return {"type": "muon", "momentum_matrix": M}
         return {"type": "sgd"}

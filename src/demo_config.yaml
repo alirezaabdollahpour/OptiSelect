@@ -1,0 +1,276 @@
+# Config for demo.ipynb.
+# The notebook is intentionally code-complete; this file holds the knobs that
+# should change across optimizer, OptiSelect, model-size, and data-scale runs.
+
+paths:
+  repo_root: /mloscratch/homes/aabdolla/llm-optimizer-benchmark
+  datasets_dir: /mloscratch/homes/aabdolla/datasets
+  results_dir: /mloscratch/homes/aabdolla/results/demo_optiselect_dclm_edu_comprehensive
+  hf_cache_dir: /mloscratch/homes/aabdolla/datasets/hf_cache
+
+dataset:
+  name: dclm-edu
+  hf_dataset: HuggingFaceTB/dclm-edu
+  hf_revision: main
+  # Keep the shard list explicit for reproducibility. These ten shards are
+  # enough for a comprehensive notebook-scale experiment while avoiding an
+  # accidental materialization of the full DCLM-Edu corpus.
+  data_files:
+    - data/000_00000.parquet
+    - data/000_00001.parquet
+    - data/000_00002.parquet
+    - data/000_00003.parquet
+    - data/000_00004.parquet
+    - data/000_00005.parquet
+    - data/000_00006.parquet
+    - data/000_00007.parquet
+    - data/000_00008.parquet
+    - data/000_00009.parquet
+  text_column: text
+  score_column: edu_int_score
+  # Keep the candidate pool broad enough for OptiSelect to reject weak data.
+  # Set this to 3 only when you want a high-quality-only corpus ablation.
+  min_edu_score: null
+  num_train_docs: 500000
+  num_val_docs: 50000
+  min_train_tokens: 100000000
+  min_val_tokens: 10000000
+  local_dir: dclm-edu-comprehensive
+  streaming: true
+  load_tokens_in_ram: false
+
+tokenizer:
+  type: byte_bpe
+  vocab_size: 8192
+  min_frequency: 2
+  initial_alphabet: byte_level
+  bos_token: "<|bos|>"
+  dtype: uint16
+
+model:
+  family: demo_gpt
+  depth: 8
+  aspect_ratio: 64
+  head_dim: 64
+  max_seq_len: 1024
+  # Compute LM loss in token chunks so the notebook never materializes a
+  # full device_batch_size × sequence × vocab fp32 logits tensor.
+  logit_chunk_tokens: 16384
+  dropout: 0.0
+  use_compile: true
+
+training:
+  seed: 42
+  device: auto
+  dtype: bfloat16
+  device_batch_size: 128
+  total_batch_tokens: 131072
+  # Fixed token budgets make optimizer comparisons precise. With the default
+  # 131,072-token update batch, both standard and OptiSelect resolve to 7,630
+  # optimizer updates. The result JSON separately records candidate-scored
+  # tokens and implementation-level processed tokens, including the selected
+  # batch recompute.
+  iterations: auto_from_token_budget
+  standard_update_tokens: 1000000000
+  optiselect_update_tokens: 1000000000
+  time_budget_sec: null
+  eval_interval: 500
+  eval_tokens: 33554432
+  final_eval_tokens: 134217728
+  eval_batches: auto_from_eval_tokens
+  final_eval_batches: auto_from_final_eval_tokens
+  grad_clip: 1.0
+  log_interval: 10
+  warmup_ratio: 0.05
+  cooldown_ratio: 0.30
+  final_lr_fraction: 0.10
+
+selection:
+  # Default proxy: held-out DCLM-Edu documents. The DDP launcher can override
+  # this to `downstream`; in that mode demo_dclm_ddp.py downloads the requested
+  # HF benchmark validation splits and tokenizes them with this demo's byte-BPE
+  # tokenizer, so the 8192-vocab model never sees GPT-2-BPE token IDs.
+  proxy_source: dclm_edu_heldout
+  proxy_unit: documents
+  proxy_tasks:
+    - hellaswag
+    - arc_easy
+    - arc_challenge
+    - openbookqa
+  candidate_multiplier: 2
+  # The engine z-scores the per-round utility before Boltzmann sampling, so
+  # this temperature is in normalized utility units.
+  temperature: 0.5
+  use_countsketch: true
+  sketch_dim: 8192
+  countsketch_row_block: 32
+  countsketch_token_block: 32
+  redundancy_weight: 1.0
+  val_proxy_size: 2048
+  proxy_batch_size: 16
+  val_proxy_refresh: 500
+  candidate_chunk_size: 16
+
+scaling:
+  enabled: true
+  reference_n_embd: 512
+  reference_batch_tokens: 131072
+  default_width_power: 0.0
+  default_batch_power: 0.0
+
+safety:
+  # This directly guards against the common benchmark bug where Sophia,
+  # d-Muon, sign-based methods, and SGD inherit AdamW's LR.
+  forbid_same_lr_as_adamw_for:
+    - d-muon
+    - sophia
+    - signsgd
+    - sgd
+  dmuon_force_adamw_fallback:
+    - token_embeddings
+    - value_embeddings
+    - lm_head
+
+optimizers:
+  adamw:
+    display_name: AdamW
+    lr: 3.0e-4
+    beta1: 0.9
+    beta2: 0.95
+    weight_decay: 0.1
+
+  d-muon:
+    display_name: d-Muon
+    lr: 1.0e-3
+    adamw_lr: 3.0e-4
+    beta1: 0.9
+    beta2: 0.99
+    momentum: 0.95
+    nesterov: true
+    muon_ns_steps: 5
+    matched_adamw_rms: 0.2
+    weight_decay: 0.1
+
+  sgd:
+    display_name: SGD
+    lr: 3.0e-2
+    momentum: 0.9
+    nesterov: true
+    weight_decay: 0.1
+
+  signsgd:
+    display_name: signSGD
+    lr: 2.0e-4
+    momentum: 0.0
+    nesterov: false
+    weight_decay: 0.1
+
+  ademamix:
+    display_name: AdEMAMix
+    lr: 5.0e-4
+    beta1: 0.9
+    beta2: 0.999
+    beta3: 0.999
+    alpha: 8.0
+    beta3_warmup: auto_iterations
+    alpha_warmup: auto_iterations
+    weight_decay: 0.1
+
+  sophia:
+    display_name: SophiaG
+    lr: 5.0e-4
+    beta1: 0.95
+    beta2: 0.99
+    rho: 0.04
+    precondition_frequency: 10
+    sophia_bs: auto_effective_batch_examples
+    weight_decay: 0.1
+
+runs:
+  adamw:
+    optimizer: adamw
+    optiselect: false
+  optiselect_adamw:
+    optimizer: adamw
+    optiselect: true
+
+  d-muon:
+    optimizer: d-muon
+    optiselect: false
+  optiselect_d-muon:
+    optimizer: d-muon
+    optiselect: true
+
+  sgd:
+    optimizer: sgd
+    optiselect: false
+  optiselect_sgd:
+    optimizer: sgd
+    optiselect: true
+
+  signsgd:
+    optimizer: signsgd
+    optiselect: false
+  optiselect_signsgd:
+    optimizer: signsgd
+    optiselect: true
+
+  ademamix:
+    optimizer: ademamix
+    optiselect: false
+  optiselect_ademamix:
+    optimizer: ademamix
+    optiselect: true
+
+  sophia:
+    optimizer: sophia
+    optiselect: false
+  optiselect_sophia:
+    optimizer: sophia
+    optiselect: true
+
+experiment:
+  # Comprehensive default: all requested optimizers and their OptiSelect
+  # variants. Keep this list intact for reportable runs.
+  profile: comprehensive
+  run_keys:
+    - adamw
+    - optiselect_adamw
+    - d-muon
+    - optiselect_d-muon
+    - sgd
+    - optiselect_sgd
+    - signsgd
+    - optiselect_signsgd
+    - ademamix
+    - optiselect_ademamix
+    - sophia
+    - optiselect_sophia
+
+evaluation:
+  validation:
+    metric: dclm_edu_heldout_perplexity
+    eval_tokens: 33554432
+    final_eval_tokens: 134217728
+  lm_eval_harness:
+    enabled: true
+    # Zero-shot OOD tasks evaluated through the notebook's DemoHarnessLM wrapper,
+    # so all tasks score the trained byte-BPE DCLM-Edu model directly.
+    # Note: mmlu expands to the full subject suite and gsm8k uses generate_until.
+    # Keep limit: null for reportable numbers; use a small integer only for a
+    # smoke test while debugging the notebook.
+    tasks:
+      - hellaswag
+      - arc_easy
+      - arc_challenge
+      - winogrande
+      - piqa
+      - lambada_openai
+      - openbookqa
+      - mmlu
+      - gsm8k
+    num_fewshot: 0
+    batch_size: 8
+    limit: null
+    bootstrap_iters: 100000
+    log_samples: false

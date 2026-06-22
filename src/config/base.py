@@ -354,6 +354,13 @@ def parse_args(base_parser, args, namespace):
         help="Paper Eq. 4 / Appendix C: redundancy term weight λ_r (default: 1.0)",
     )
     parser.add_argument(
+        "--selection_countsketch_token_block",
+        default=128,
+        type=int,
+        help="Number of sequence positions sketched at once in the corrected "
+             "token-wise CountSketch path (default: 128)",
+    )
+    parser.add_argument(
         "--val_proxy_size",
         default=4096,
         type=int,

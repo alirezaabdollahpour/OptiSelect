@@ -1,0 +1,9 @@
+check,status,message
+model architecture,ok,model architecture: c479728e4d2e
+dataset fingerprint,ok,dataset fingerprint: d4439064ee534a4b
+global update batch tokens,ok,global update batch tokens: 131072
+DDP world size,warn,"DDP world size: 1, 2, 4"
+adamw pair,ok,"AdamW has optiselect, standard; missing none"
+d-muon pair,ok,"d-Muon has optiselect, standard; missing none"
+signsgd pair,warn,signSGD has optiselect; missing standard
+ademamix pair,ok,"AdEMAMix has optiselect, standard; missing none"

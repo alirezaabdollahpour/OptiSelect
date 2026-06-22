@@ -5,6 +5,7 @@ torchaudio
 torchvision
 tqdm
 transformers
+typing_extensions>=4.13.2
 wandb
 datasets
 huggingface_hub[hf_transfer]
