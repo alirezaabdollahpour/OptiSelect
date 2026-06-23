@@ -126,3 +126,7 @@ shakespeare_results_*.json
 *.pdf 
 *.png
 *.jpg
+.csv
+src/figures/
+src/figures/*
+src/figures
