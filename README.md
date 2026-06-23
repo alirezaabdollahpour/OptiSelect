@@ -415,6 +415,63 @@ python csub.py -n demo-dclm-signsgd-equal1b-downproxy-ddp2 -g 2 -t 1d \
     bash demo_DCLM.sh"
 ```
 
+For Signum with Nesterov momentum, use the `signum` optimizer rather than
+`signsgd`. The `signsgd` benchmark is the zero-momentum sign baseline, while
+Nesterov requires `momentum > 0`. This command creates a derived YAML config
+inside the results tree, enables Nesterov for Signum, and then launches the
+OptiSelect Signum run:
+
+```bash
+python csub.py -n demo-dclm-signum-nesterov-equal1b-downproxy-ddp2 -g 2 -t 1d \
+  --train --large-shm --node-type h100 \
+  --command "cd /mloscratch/homes/aabdolla/llm-optimizer-benchmark/src && \
+    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
+    python -c 'from pathlib import Path; import yaml; src=Path(\"/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src/demo_config.yaml\"); dst=Path(\"/mloscratch/homes/aabdolla/results/configs/demo_config_signum_nesterov_seed42.yaml\"); dst.parent.mkdir(parents=True, exist_ok=True); cfg=yaml.safe_load(src.read_text()); cfg[\"optimizers\"][\"signum\"][\"momentum\"]=0.9; cfg[\"optimizers\"][\"signum\"][\"dampening\"]=0.0; cfg[\"optimizers\"][\"signum\"][\"nesterov\"]=True; dst.write_text(yaml.safe_dump(cfg, sort_keys=False))' && \
+    DEMO_NPROC=2 \
+    DEMO_CONFIG=/mloscratch/homes/aabdolla/results/configs/demo_config_signum_nesterov_seed42.yaml \
+    DEMO_RUN_KEYS=optiselect_signum \
+    DEMO_SEED=42 \
+    DEMO_STANDARD_UPDATE_TOKENS=1000000000 \
+    DEMO_OPTISELECT_UPDATE_TOKENS=1000000000 \
+    DEMO_PROXY_SOURCE=downstream \
+    DEMO_PROXY_TASKS=hellaswag,arc_easy,arc_challenge,openbookqa \
+    DEMO_CANDIDATE_MULTIPLIER=2 \
+    DEMO_USE_COUNTSKETCH=1 \
+    DEMO_SKETCH_DIM=16384 \
+    DEMO_COUNTSKETCH_ROW_BLOCK=32 \
+    DEMO_COUNTSKETCH_TOKEN_BLOCK=128 \
+    DEMO_VAL_PROXY_SIZE=8192 \
+    DEMO_PROXY_BATCH_SIZE=32 \
+    DEMO_CANDIDATE_CHUNK_SIZE=16 \
+    DEMO_RESULTS_DIR=/mloscratch/homes/aabdolla/results/demo_dclm_signum_nesterov_equal1B_downstreamproxy_hs_arc_obqa_ddp2_h100_seed42_new \
+    DEMO_SUMMARY_NAME=demo_dclm_ddp_summary.json \
+    bash demo_DCLM.sh"
+```
+
+The inline `python -c` command is a reproducibility convenience. It avoids
+editing the tracked `src/demo_config.yaml` in a scheduler job and writes the
+exact derived config used by the run:
+
+```python
+from pathlib import Path
+import yaml
+
+src = Path('/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src/demo_config.yaml')
+dst = Path('/mloscratch/homes/aabdolla/results/configs/demo_config_signum_nesterov_seed42.yaml')
+dst.parent.mkdir(parents=True, exist_ok=True)
+
+cfg = yaml.safe_load(src.read_text())
+cfg['optimizers']['signum']['momentum'] = 0.9
+cfg['optimizers']['signum']['dampening'] = 0.0
+cfg['optimizers']['signum']['nesterov'] = True
+dst.write_text(yaml.safe_dump(cfg, sort_keys=False))
+```
+
+The launcher then points `DEMO_CONFIG` at this derived YAML and uses
+`DEMO_RUN_KEYS=optiselect_signum`. Keep the generated config path, job name,
+and `DEMO_RESULTS_DIR` aligned with the optimizer and seed so later result
+aggregation remains unambiguous.
+
 Change `DEMO_RUN_KEYS` and `DEMO_RESULTS_DIR` together for each new optimizer
 or ablation so outputs do not collide. For example, use
 `DEMO_RUN_KEYS=optiselect_lion` with a results directory containing `lion` for
