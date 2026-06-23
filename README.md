@@ -225,6 +225,204 @@ Results are written under `src/logs/` and `src/exps/` (both gitignored).
 
 ---
 
+## DCLM-Edu demo benchmark
+
+The DCLM-Edu benchmark entry points are:
+
+- [`src/demo.ipynb`](src/demo.ipynb) — interactive, single-process notebook for
+  developing and inspecting runs.
+- [`src/demo_config.yaml`](src/demo_config.yaml) — canonical benchmark
+  configuration: dataset shards, model size, token budgets, optimizer
+  hyperparameters, OptiSelect settings, and evaluation settings.
+- [`src/demo_DCLM.sh`](src/demo_DCLM.sh) — non-interactive launcher around
+  [`src/demo_dclm_ddp.py`](src/demo_dclm_ddp.py), intended for reproducible
+  local, DDP, and scheduler-managed runs.
+
+Although these files are named "demo", they are configured for rigorous
+optimizer and OptiSelect comparisons: fixed update-token budgets, fixed
+validation budgets, explicit optimizer-specific learning rates, and result
+JSONs with token accounting.
+
+### Running `demo.ipynb`
+
+Use the notebook when you want an inspectable single-GPU workflow, quick
+configuration iteration, plots during training, or final
+`lm-evaluation-harness` evaluation from the trained notebook model.
+
+1. Start Jupyter from the repository or source directory.
+2. Run the dependency/setup cells once in a fresh environment.
+3. Run the config and derived-settings cells. The notebook loads
+   `src/demo_config.yaml` into `CFG`.
+4. Optionally override `CFG` fields in the sweep cell before launching.
+5. Run the sweep cell. Each run writes a per-run `summary.json`; the sweep
+   cell also writes one combined summary JSON under `CFG['paths']['results_dir']`.
+
+Example single-run downstream-proxy sweep:
+
+```python
+ALL_RESULTS = {}
+ALL_HISTORIES = {}
+LAST_MODEL = None
+
+CFG['experiment']['run_keys'] = ['optiselect_signsgd']
+
+CFG['selection']['proxy_source'] = 'downstream'
+CFG['selection']['proxy_tasks'] = [
+    'hellaswag',
+    'arc_easy',
+    'arc_challenge',
+    'openbookqa',
+]
+CFG['selection']['candidate_multiplier'] = 2
+CFG['selection']['use_countsketch'] = True
+CFG['selection']['sketch_dim'] = 16384
+CFG['selection']['countsketch_token_block'] = 128
+CFG['selection']['val_proxy_size'] = 8192
+CFG['selection']['proxy_batch_size'] = 32
+CFG['selection']['candidate_chunk_size'] = 16
+
+CFG['paths']['results_dir'] = '/mloscratch/homes/aabdolla/results/demo_signsgd_downstream_proxy_cm2'
+Path(CFG['paths']['results_dir']).expanduser().mkdir(parents=True, exist_ok=True)
+
+validate_selection_proxy(CFG)
+
+for run_key in CFG['experiment']['run_keys']:
+    result, LAST_MODEL = run_experiment(run_key, CFG, live_histories=ALL_HISTORIES)
+    ALL_RESULTS[run_key] = result
+    ALL_HISTORIES[run_key] = result['history']
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    gc.collect()
+```
+
+Valid run keys are defined in `demo_config.yaml` under `runs:`. Standard and
+OptiSelect variants use the same optimizer hyperparameter block:
+
+```text
+adamw, optiselect_adamw
+d-muon, optiselect_d-muon
+sgd, optiselect_sgd
+signsgd, optiselect_signsgd
+lion, optiselect_lion
+signum, optiselect_signum
+ademamix, optiselect_ademamix
+sophia, optiselect_sophia
+```
+
+For sign-based momentum experiments, use `signum`. The `signsgd` run is the
+zero-momentum signSGD baseline; Nesterov momentum requires `momentum > 0` and
+therefore belongs in the `signum` configuration.
+
+### Running `demo_DCLM.sh`
+
+Use `demo_DCLM.sh` for unattended runs. It reads `demo_config.yaml`, applies
+environment-variable overrides, validates the requested run keys, and launches
+`demo_dclm_ddp.py` with `torchrun`.
+
+Single-GPU run:
+
+```bash
+cd /mloscratch/homes/aabdolla/llm-optimizer-benchmark/src
+source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate
+DEMO_NPROC=1 \
+DEMO_RUN_KEYS=optiselect_signsgd \
+bash demo_DCLM.sh
+```
+
+Multi-GPU run on one node:
+
+```bash
+cd /mloscratch/homes/aabdolla/llm-optimizer-benchmark/src
+source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate
+DEMO_NPROC=4 \
+DEMO_RUN_KEYS=optiselect_adamw,optiselect_lion \
+DEMO_RESULTS_DIR=/mloscratch/homes/aabdolla/results/demo_dclm_adamw_lion_ddp4_seed42 \
+bash demo_DCLM.sh
+```
+
+The launcher keeps the benchmark's batch semantics global: `DEMO_NPROC`
+controls `torchrun --nproc_per_node`, while `training.device_batch_size` and
+`training.total_batch_tokens` remain global settings from the YAML unless
+explicitly overridden.
+
+Useful launcher variables:
+
+| Variable | Purpose |
+|---|---|
+| `DEMO_NPROC` | Number of local GPU processes. |
+| `DEMO_CONFIG` | Path to `demo_config.yaml`. |
+| `DEMO_RUN_KEYS` | Comma-separated run keys from the YAML. |
+| `DEMO_SEED` | Training/data seed. |
+| `DEMO_STANDARD_UPDATE_TOKENS` | Standard-run update-token budget. |
+| `DEMO_OPTISELECT_UPDATE_TOKENS` | OptiSelect selected/update-token budget. |
+| `DEMO_PROXY_SOURCE` | `dclm_edu_heldout` or `downstream`. |
+| `DEMO_PROXY_TASKS` | Comma-separated downstream proxy tasks. |
+| `DEMO_CANDIDATE_MULTIPLIER` | Candidate batch multiplier for OptiSelect. |
+| `DEMO_USE_COUNTSKETCH` | `1` for CountSketch scoring, `0` for exact Ghost factors. |
+| `DEMO_SKETCH_DIM` | CountSketch feature dimension. |
+| `DEMO_VAL_PROXY_SIZE` | Number of proxy examples/documents. |
+| `DEMO_PROXY_BATCH_SIZE` | Proxy factor batch size. |
+| `DEMO_CANDIDATE_CHUNK_SIZE` | Candidate-factor chunk size. |
+| `DEMO_RESULTS_DIR` | Output directory for per-run summaries and sweep summary. |
+| `DEMO_SUMMARY_NAME` | Combined sweep summary filename. |
+| `DEMO_SMOKE_STEPS` | Short-run override for launcher validation. |
+| `DEMO_DRY_RUN` | Set to `1` to print the generated `torchrun` command. |
+
+Recommended smoke test before a long allocation:
+
+```bash
+DEMO_NPROC=1 \
+DEMO_RUN_KEYS=optiselect_signsgd \
+DEMO_SMOKE_STEPS=5 \
+DEMO_EVAL_INTERVAL=5 \
+DEMO_EVAL_TOKENS=1048576 \
+DEMO_FINAL_EVAL_TOKENS=1048576 \
+DEMO_DRY_RUN=1 \
+bash demo_DCLM.sh
+```
+
+Remove `DEMO_DRY_RUN=1` to actually launch the smoke test.
+
+### Run:ai / `csub.py` example
+
+For remote H100 jobs managed through Run:ai, pass the launcher variables inside
+the submitted command. This example runs the 1B-token downstream-proxy
+OptiSelect signSGD benchmark on two H100 GPUs:
+
+```bash
+python csub.py -n demo-dclm-signsgd-equal1b-downproxy-ddp2 -g 2 -t 1d \
+  --train --large-shm --node-type h100 \
+  --command "cd /mloscratch/homes/aabdolla/llm-optimizer-benchmark/src && \
+    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
+    DEMO_NPROC=2 \
+    DEMO_CONFIG=/mloscratch/homes/aabdolla/llm-optimizer-benchmark/src/demo_config.yaml \
+    DEMO_RUN_KEYS=optiselect_signsgd \
+    DEMO_SEED=42 \
+    DEMO_STANDARD_UPDATE_TOKENS=1000000000 \
+    DEMO_OPTISELECT_UPDATE_TOKENS=1000000000 \
+    DEMO_PROXY_SOURCE=downstream \
+    DEMO_PROXY_TASKS=hellaswag,arc_easy,arc_challenge,openbookqa \
+    DEMO_CANDIDATE_MULTIPLIER=2 \
+    DEMO_USE_COUNTSKETCH=1 \
+    DEMO_SKETCH_DIM=16384 \
+    DEMO_COUNTSKETCH_ROW_BLOCK=32 \
+    DEMO_COUNTSKETCH_TOKEN_BLOCK=128 \
+    DEMO_VAL_PROXY_SIZE=8192 \
+    DEMO_PROXY_BATCH_SIZE=32 \
+    DEMO_CANDIDATE_CHUNK_SIZE=16 \
+    DEMO_RESULTS_DIR=/mloscratch/homes/aabdolla/results/demo_dclm_signsgd_equal1B_downstreamproxy_hs_arc_obqa_ddp2_h100_seed42_new \
+    DEMO_SUMMARY_NAME=demo_dclm_ddp_summary.json \
+    bash demo_DCLM.sh"
+```
+
+Change `DEMO_RUN_KEYS` and `DEMO_RESULTS_DIR` together for each new optimizer
+or ablation so outputs do not collide. For example, use
+`DEMO_RUN_KEYS=optiselect_lion` with a results directory containing `lion` for
+a Lion run, or `DEMO_RUN_KEYS=signum,optiselect_signum` to run both Signum
+variants.
+
+---
+
 ## Supported optimizers for selection
 
 The scoring operator $\mathcal{O}_t$ is implemented for the following
