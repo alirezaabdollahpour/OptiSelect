@@ -37,6 +37,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
 
 from optim.ademamix import AdEMAMix
+from optim.lion import Lion
 from optim.muon import DistributedMuon
 from optim.sign import Signum
 from optim.sophia import SophiaG
@@ -343,7 +344,7 @@ def validate_cfg(cfg: dict, info: DistInfo):
     missing = [k for k in run_keys if k not in cfg["runs"]]
     if missing:
         raise ValueError(f"Unknown run key(s): {missing}")
-    supported_opts = {"adamw", "d-muon", "sgd", "signsgd", "ademamix", "sophia"}
+    supported_opts = {"adamw", "d-muon", "sgd", "signsgd", "lion", "signum", "ademamix", "sophia"}
     unsupported = [k for k in run_keys if cfg["runs"][k]["optimizer"] not in supported_opts]
     if unsupported:
         raise ValueError(
@@ -1167,6 +1168,27 @@ def build_optimizer(model: nn.Module, opt_key: str, cfg: dict, resolved_iteratio
             sign_update=True,
         )
         repo_opt_name = "signsgd"
+    elif opt_key == "lion":
+        groups = adam_style_param_groups(model, wd)
+        opt = Lion(
+            groups,
+            lr=lr,
+            betas=(float(opt_cfg["beta1"]), float(opt_cfg["beta2"])),
+            weight_decay=wd,
+        )
+        repo_opt_name = "lion"
+    elif opt_key == "signum":
+        groups = adam_style_param_groups(model, wd)
+        opt = Signum(
+            groups,
+            lr=lr,
+            momentum=float(opt_cfg.get("momentum", 0.9)),
+            dampening=float(opt_cfg.get("dampening", 0.0)),
+            nesterov=bool(opt_cfg.get("nesterov", False)),
+            weight_decay=wd,
+            sign_update=True,
+        )
+        repo_opt_name = "signum"
     elif opt_key == "sophia":
         groups = adam_style_param_groups(model, wd)
         opt = SophiaG(

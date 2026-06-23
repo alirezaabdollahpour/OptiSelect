@@ -118,7 +118,7 @@ run_keys = [x.strip() for x in "${DEMO_RUN_KEYS}".split(",") if x.strip()]
 missing = [k for k in run_keys if k not in cfg["runs"]]
 if missing:
     raise SystemExit(f"[FATAL] Unknown run key(s): {missing}; valid keys are {sorted(cfg['runs'])}")
-supported_opts = {"adamw", "d-muon", "sgd", "signsgd", "ademamix", "sophia"}
+supported_opts = {"adamw", "d-muon", "sgd", "signsgd", "lion", "signum", "ademamix", "sophia"}
 unsupported = [k for k in run_keys if cfg["runs"][k]["optimizer"] not in supported_opts]
 if unsupported:
     raise SystemExit(f"[FATAL] Unsupported optimizer in run key(s): {unsupported}; supported: {sorted(supported_opts)}")

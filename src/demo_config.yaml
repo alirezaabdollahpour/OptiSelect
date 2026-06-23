@@ -125,6 +125,8 @@ safety:
     - d-muon
     - sophia
     - signsgd
+    - lion
+    - signum
     - sgd
   dmuon_force_adamw_fallback:
     - token_embeddings
@@ -162,6 +164,21 @@ optimizers:
     display_name: signSGD
     lr: 2.0e-4
     momentum: 0.0
+    nesterov: false
+    weight_decay: 0.1
+
+  lion:
+    display_name: Lion
+    lr: 1.0e-4
+    beta1: 0.9
+    beta2: 0.99
+    weight_decay: 0.1
+
+  signum:
+    display_name: Signum
+    lr: 2.0e-4
+    momentum: 0.9
+    dampening: 0.0
     nesterov: false
     weight_decay: 0.1
 
@@ -215,6 +232,20 @@ runs:
     optimizer: signsgd
     optiselect: true
 
+  lion:
+    optimizer: lion
+    optiselect: false
+  optiselect_lion:
+    optimizer: lion
+    optiselect: true
+
+  signum:
+    optimizer: signum
+    optiselect: false
+  optiselect_signum:
+    optimizer: signum
+    optiselect: true
+
   ademamix:
     optimizer: ademamix
     optiselect: false
@@ -242,6 +273,10 @@ experiment:
     - optiselect_sgd
     - signsgd
     - optiselect_signsgd
+    - lion
+    - optiselect_lion
+    - signum
+    - optiselect_signum
     - ademamix
     - optiselect_ademamix
     - sophia
